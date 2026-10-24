@@ -1,0 +1,22 @@
+# Local data: credentials, annotations and exports live here. Never commit it.
+app_data/
+
+# Python
+backend/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Node
+node_modules/
+
+# Env files (examples are committed)
+.env
+.env.*
+!.env.example
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

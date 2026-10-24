@@ -1,0 +1,16 @@
+{
+  "name": "lemon",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted video annotation: timestamps + metadata checkboxes, streamed from S3.",
+  "license": "MIT",
+  "scripts": {
+    "setup": "node scripts/setup.mjs",
+    "dev": "node scripts/dev.mjs",
+    "build": "npm --prefix frontend run build",
+    "start": "node scripts/dev.mjs --prod"
+  },
+  "engines": {
+    "node": ">=20.9"
+  }
+}
