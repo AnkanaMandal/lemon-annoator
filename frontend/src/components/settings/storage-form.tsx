@@ -66,13 +66,15 @@ export function StorageForm({ project }: { project: Project }) {
   const [form, setForm] = useState<FormState>(() => fromProject(project));
   const [baseline, setBaseline] = useState<FormState>(() => fromProject(project));
   const [clearSecret, setClearSecret] = useState(false);
+  const [clearToken, setClearToken] = useState(false);
   const [showSecret, setShowSecret] = useState(false);
   const [advanced, setAdvanced] = useState(Boolean(project.storage.endpoint_url || project.storage.has_session_token));
   const [testResult, setTestResult] = useState<{ ok: ConnectionTestResult } | { error: unknown } | null>(null);
   const update = useUpdateProject(project.id);
 
   const hasSecret = project.storage.has_secret_access_key && !clearSecret;
-  const dirty = JSON.stringify(form) !== JSON.stringify(baseline) || clearSecret;
+  const hasToken = project.storage.has_session_token && !clearToken;
+  const dirty = JSON.stringify(form) !== JSON.stringify(baseline) || clearSecret || clearToken;
 
   const set = (patch: Partial<FormState>) => {
     setForm((f) => ({ ...f, ...patch }));
@@ -97,6 +99,7 @@ export function StorageForm({ project }: { project: Project }) {
     if (form.secret_access_key) body.secret_access_key = form.secret_access_key.trim();
     else if (clearSecret) body.secret_access_key = "";
     if (form.session_token) body.session_token = form.session_token.trim();
+    else if (clearToken) body.session_token = "";
     return body;
   };
 
@@ -115,6 +118,7 @@ export function StorageForm({ project }: { project: Project }) {
           setForm(next);
           setBaseline(next);
           setClearSecret(false);
+          setClearToken(false);
           toast.success("Storage settings saved");
         },
         onError: (err) => {
@@ -248,9 +252,18 @@ export function StorageForm({ project }: { project: Project }) {
               label="Session token"
               htmlFor="token"
               hint={
-                project.storage.has_session_token
-                  ? "Saved. Leave blank to keep it."
-                  : "Only for temporary (STS) credentials."
+                hasToken ? (
+                  <>
+                    Saved. Leave blank to keep it ·{" "}
+                    <button type="button" className="underline underline-offset-2" onClick={() => setClearToken(true)}>
+                      clear
+                    </button>
+                  </>
+                ) : clearToken ? (
+                  "Will be cleared on save."
+                ) : (
+                  "Only for temporary (STS) credentials."
+                )
               }
             >
               <Input

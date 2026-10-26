@@ -292,14 +292,19 @@ class ProjectStore:
                 warnings.append(f"Skipped {row['video_key']}: {exc.message}")
         return out, warnings
 
-    def stats(self, project_id: str) -> ProgressStats:
+    def stats(self, project: Project) -> ProgressStats:
+        """Progress of what the queue shows: the current bucket and folder. Annotations left from an
+        earlier folder stay saved but are not counted against this folder's videos (all_annotated
+        counts them: everything that deleting the project removes)."""
         with self.db.transaction() as conn:
             row = conn.execute(
-                "select count(*) filter (where status = 'completed') as completed, "
-                "count(*) filter (where status = 'in_progress') as in_progress, "
-                f"coalesce(sum(event_count), 0) as total_events from {self.annotations} "
-                "where project_id = %s and deleted_at is null",
-                (project_id,),
+                "select count(*) filter (where status in ('completed', 'in_progress')) as all_annotated, "
+                "count(*) filter (where here and status = 'completed') as completed, "
+                "count(*) filter (where here and status = 'in_progress') as in_progress, "
+                "coalesce(sum(event_count) filter (where here), 0) as total_events "
+                "from (select status, event_count, (bucket is null or bucket = %s) and starts_with(video_key, %s) "
+                f"as here from {self.annotations} where project_id = %s and deleted_at is null) as a",
+                (project.storage.bucket, project.storage.normalized_prefix, project.id),
             ).fetchone()
         return ProgressStats(**row)
 

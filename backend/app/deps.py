@@ -23,5 +23,5 @@ def to_public(project: Project, store: ProjectStore) -> ProjectPublic:
         label_schema=project.label_schema,
         settings=project.settings,
         last_sync=project.last_sync,
-        stats=store.stats(project.id),
+        stats=store.stats(project),
     )

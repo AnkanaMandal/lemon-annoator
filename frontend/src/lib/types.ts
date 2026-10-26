@@ -67,7 +67,8 @@ export interface Project {
   label_schema: LabelSchema;
   settings: ProjectSettings;
   last_sync: SyncInfo | null;
-  stats: { completed: number; in_progress: number; total_events: number };
+  /** completed / in_progress / total_events: current bucket and folder. all_annotated: every folder. */
+  stats: { completed: number; in_progress: number; total_events: number; all_annotated: number };
 }
 
 export interface ProjectUpdate {

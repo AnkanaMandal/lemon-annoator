@@ -33,7 +33,8 @@ export function DeleteProject({ project }: { project: Project }) {
   const [open, setOpen] = useState(false);
   const [typed, setTyped] = useState("");
   const confirmed = typed.trim().toLowerCase() === CONFIRM_WORD;
-  const annotated = project.stats.completed + project.stats.in_progress;
+  // Deleting removes every annotation, including ones from folders other than the current one.
+  const annotated = project.stats.all_annotated;
 
   const remove = useMutation({
     mutationFn: () => api.deleteProject(project.id),
