@@ -127,3 +127,25 @@ def test_session_token_can_be_cleared(client, project, db):
     assert res.json()["storage"]["has_session_token"] is False
     stored = db("select data from {s}.projects where id = %s", (project,))[0]["data"]
     assert stored["storage"]["session_token"] == ""
+
+
+def test_database_connection_errors_name_the_cause():
+    import time
+
+    import pytest
+
+    from app.db import Database, connection_hint
+    from app.errors import StorageError
+
+    started = time.monotonic()
+    with pytest.raises(StorageError) as err:
+        Database("postgresql://postgres:pw@127.0.0.1:1/postgres", "lemon")  # nothing listens on port 1
+    assert time.monotonic() - started < 15  # the real error, not the pool's 20 s timeout
+    assert "Could not connect to the database" in err.value.message and err.value.hint
+
+    direct = "postgresql://postgres:pw@db.abcdefgh.supabase.co:5432/postgres"
+    assert "IPv6" in connection_hint(direct, "timeout")
+    pooler = "postgresql://postgres.abcdefgh:[YOUR-PASSWORD]@aws-0-ap-south-1.pooler.supabase.com:5432/postgres"
+    assert "[YOUR-PASSWORD]" in connection_hint(pooler, "")
+    wrong = pooler.replace("[YOUR-PASSWORD]", "secret")
+    assert "Wrong database password" in connection_hint(wrong, 'FATAL: password authentication failed for user "x"')

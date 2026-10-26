@@ -7,6 +7,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 import psycopg
+from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
@@ -72,6 +73,41 @@ alter table {s}.exports enable row level security;
 """
 
 
+def _probe(url: str) -> None:
+    """One plain connection attempt before the pool opens: the pool only retries and finally reports a
+    timeout, which hides the real cause (wrong password, unreachable host...)."""
+    try:
+        with psycopg.connect(url, connect_timeout=10, prepare_threshold=None):
+            pass
+    except psycopg.Error as exc:
+        detail = " ".join(str(exc).split()) or type(exc).__name__
+        raise StorageError(
+            f"Could not connect to the database: {detail}",
+            code="DATABASE_UNAVAILABLE",
+            hint=connection_hint(url, detail),
+        ) from exc
+
+
+def connection_hint(url: str, error: str) -> str:
+    """The likely fix for a failed connection, for the usual Supabase mistakes."""
+    try:
+        params = conninfo_to_dict(url)
+    except psycopg.ProgrammingError:
+        return ("LEMON_DATABASE_URL is not a valid connection string. If the password contains characters "
+                "such as @ # / ? %, reset it in Supabase to letters and numbers only.")
+    host = str(params.get("host") or "")
+    password = str(params.get("password") or "")
+    if host.startswith("db.") and host.endswith(".supabase.co"):
+        return ("This is Supabase's direct connection, which only works over IPv6 (Render can't reach it). "
+                "Use Connect > Connection String > Method: Session pooler instead.")
+    if not password or "YOUR-PASSWORD" in password:
+        return "Put your database password in the connection string in place of [YOUR-PASSWORD]."
+    if "password authentication failed" in error:
+        return ("Wrong database password. Use the one from Supabase > Project Settings > Database "
+                "(reset it there if needed), not your Supabase login password.")
+    return "Check LEMON_DATABASE_URL. On Render, use Supabase's session pooler connection string."
+
+
 class Database:
     def __init__(self, url: str, schema: str) -> None:
         if not url:
@@ -83,6 +119,7 @@ class Database:
         if not SCHEMA_NAME_RE.match(schema):
             raise StorageError(f'"{schema}" is not a valid schema name.', code="DATABASE_NOT_CONFIGURED")
         self.schema = schema
+        _probe(url)
         self.pool = ConnectionPool(
             url,
             min_size=1,
