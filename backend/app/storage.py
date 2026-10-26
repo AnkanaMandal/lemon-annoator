@@ -376,13 +376,20 @@ class ProjectStore:
                     out.append(ann)
         return out, warnings
 
-    def stats(self, project_id: str) -> ProgressStats:
+    def stats(self, project: Project) -> ProgressStats:
+        """Progress of what the queue shows: the current bucket and folder. Annotations left from an
+        earlier folder stay on disk but are not counted against this folder's videos."""
         stats = ProgressStats()
         try:
-            index = self.load_index(project_id)
+            index = self.load_index(project.id)
         except (StorageError, NotFoundError):
             return stats
-        for entry in index.values():
+        prefix = project.storage.normalized_prefix
+        for key, entry in index.items():
+            if entry.status in ("completed", "in_progress"):
+                stats.all_annotated += 1
+            if entry.bucket not in (None, project.storage.bucket) or not key.startswith(prefix):
+                continue
             if entry.status == "completed":
                 stats.completed += 1
             elif entry.status == "in_progress":

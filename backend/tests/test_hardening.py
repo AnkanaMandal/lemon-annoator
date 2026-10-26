@@ -153,3 +153,29 @@ def test_china_regions_use_the_china_endpoint():
 
     client = get_client(StorageConfig(bucket="b", region="cn-north-1", access_key_id="a", secret_access_key="s"))
     assert client.meta.endpoint_url == "https://s3.cn-north-1.amazonaws.com.cn"
+
+
+def test_progress_counts_only_the_current_folder(client, project):
+    _save(client, project, status="completed")  # clips/rally_001.mp4
+    _save(client, project, key="clips/set2/RALLY_002.MP4", events=[_event(), _event("b", 2.0)])
+    stats = client.get(f"/api/projects/{project}").json()["stats"]
+    assert stats == {"completed": 1, "in_progress": 1, "total_events": 3, "all_annotated": 2}
+
+    # After narrowing the folder, the dashboard counts what the queue shows, not every saved file.
+    client.patch(f"/api/projects/{project}", json={"storage": {"prefix": "clips/set2/"}})
+    queue = client.get(f"/api/projects/{project}/videos").json()["videos"]
+    assert sum(v["status"] == "completed" for v in queue) == 0
+    listed = next(p for p in client.get("/api/projects").json() if p["id"] == project)
+    # Deleting the project still moves both files, so the delete dialog counts every folder.
+    assert listed["stats"] == {"completed": 0, "in_progress": 1, "total_events": 2, "all_annotated": 2}
+
+
+def test_session_token_can_be_cleared(client, project, tmp_path):
+    client.patch(f"/api/projects/{project}", json={"storage": {"session_token": "OLD"}})
+    # Omitted keeps the saved token (the form leaves it blank); "" clears it.
+    assert client.patch(f"/api/projects/{project}", json={"storage": {"access_key_id": "NEW"}}).json()[
+        "storage"]["has_session_token"] is True
+    res = client.patch(f"/api/projects/{project}", json={"storage": {"session_token": ""}})
+    assert res.json()["storage"]["has_session_token"] is False
+    stored = json.loads((tmp_path / "app_data" / "projects" / project / "project.json").read_text())
+    assert stored["storage"]["session_token"] == ""

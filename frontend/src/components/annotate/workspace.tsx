@@ -702,7 +702,10 @@ function Workspace({
       pendingSave.register(projectId, null);
       setEditingId(null);
       setPreEditDraft(null);
+      // New version so an in-flight save can't restore the old events, but nothing left to save:
+      // a later Save must not write an empty "in progress" file for the video just cleared.
       versionRef.current++;
+      savedVersionRef.current = versionRef.current;
     }
     toast.success(`Cleared annotations for ${video.filename}`, {
       description: movedTo ? `Previous file moved to ${movedTo}` : undefined,

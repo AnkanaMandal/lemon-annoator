@@ -197,9 +197,12 @@ class Project(BaseModel):
 
 
 class ProgressStats(BaseModel):
+    # completed / in_progress / total_events cover the current bucket and folder (what the queue shows).
     completed: int = 0
     in_progress: int = 0
     total_events: int = 0
+    # Annotated videos in every folder and bucket: everything that deleting the project moves to the trash.
+    all_annotated: int = 0
 
 
 class ProjectPublic(BaseModel):
