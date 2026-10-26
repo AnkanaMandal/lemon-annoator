@@ -2,6 +2,10 @@ import { Suspense } from "react";
 
 import { SettingsSkeleton, SettingsView } from "@/components/settings/settings-view";
 
+// Sign-in happens in the browser (AuthGate), so the server never renders signed-in pages and
+// instant-navigation validation can't check them.
+export const instant = false;
+
 export const metadata = { title: "Settings" };
 
 export default function SettingsPage() {
