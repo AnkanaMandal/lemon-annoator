@@ -1,7 +1,10 @@
+
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 
@@ -16,32 +19,56 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Postgres connection string (Supabase: Project Settings > Database > Connection string > Session pooler).
+    # PostgreSQL connection string
     database_url: str = ""
-    # Postgres schema holding Lemon's tables. It is created on startup.
+
+    # PostgreSQL schema holding Lemon's tables
     db_schema: str = "lemon"
-    # https://<project-ref>.supabase.co, used to verify sign-in tokens (signing keys + issuer).
+
+    # Supabase project URL
     supabase_url: str = ""
-    # Only for Supabase projects that still sign tokens with the legacy shared JWT secret (HS256).
+
+    # Legacy Supabase JWT secret, if required
     supabase_jwt_secret: str = ""
-    # Comma-separated emails allowed to use the API. Empty: any user of the Supabase project.
+
+    # Comma-separated emails allowed to use the API
     allowed_emails: str = ""
-    # Comma-separated list of browser origins allowed to call the API (the Vercel URL in production).
-    cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
-    # Optional regex for extra origins, e.g. Vercel preview deployments: https://lemon-.*\.vercel\.app
+
+    # Browser origins allowed to call the API
+    cors_origins: str = (
+        "http://localhost:3000,http://127.0.0.1:3000"
+    )
+
+    # Optional regex for extra browser origins
     cors_origin_regex: str = ""
-    # Upper bound on the number of S3 objects scanned per listing.
+
+    # Maximum number of S3 objects scanned per listing
     max_list_keys: int = 50_000
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def strip_database_url(cls, value):
+        """Remove accidental whitespace around the database URL."""
+        return value.strip() if isinstance(value, str) else value
 
     @property
     def cors_origin_list(self) -> list[str]:
-        return [o.strip().rstrip("/") for o in self.cors_origins.split(",") if o.strip()]
+        return [
+            origin.strip().rstrip("/")
+            for origin in self.cors_origins.split(",")
+            if origin.strip()
+        ]
 
     @property
     def allowed_email_set(self) -> set[str]:
-        return {e.strip().lower() for e in self.allowed_emails.split(",") if e.strip()}
+        return {
+            email.strip().lower()
+            for email in self.allowed_emails.split(",")
+            if email.strip()
+        }
 
 
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
