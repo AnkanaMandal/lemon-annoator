@@ -33,16 +33,18 @@ export function DeleteProject({ project }: { project: Project }) {
   const [open, setOpen] = useState(false);
   const [typed, setTyped] = useState("");
   const confirmed = typed.trim().toLowerCase() === CONFIRM_WORD;
-  // Deleting moves every annotation, including ones from folders other than the current one.
+  // Deleting removes every annotation, including ones from folders other than the current one.
   const annotated = project.stats.all_annotated;
 
   const remove = useMutation({
     mutationFn: () => api.deleteProject(project.id),
-    onSuccess: (res) => {
+    onSuccess: () => {
       setOpen(false);
       qc.removeQueries({ queryKey: keys.project(project.id) });
       qc.invalidateQueries({ queryKey: keys.projects });
-      toast.success(`Deleted “${project.name}”`, { description: `Files moved to ${res.moved_to}` });
+      toast.success(`Deleted “${project.name}”`, {
+        description: "Its data is kept in the database and can be restored.",
+      });
       router.push("/");
     },
     onError: (err) => {
@@ -62,8 +64,8 @@ export function DeleteProject({ project }: { project: Project }) {
       <CardHeader>
         <CardTitle>Delete project</CardTitle>
         <CardDescription>
-          Moves this project&apos;s folder (config, annotations and exports) to{" "}
-          <code className="font-mono">app_data/.trash</code>. Videos in S3 are never touched.
+          Removes the project for everyone. Its settings, annotations and exports are kept in the database (marked
+          deleted), so it can be restored. Videos in S3 are never touched.
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -85,10 +87,10 @@ export function DeleteProject({ project }: { project: Project }) {
                 <AlertDialogTitle>Delete “{project.name}”?</AlertDialogTitle>
                 <AlertDialogDescription>
                   {annotated > 0
-                    ? `${annotated} annotated video${annotated === 1 ? "" : "s"} and all exports will be moved to the trash folder.`
-                    : "The project configuration will be moved to the trash folder."}{" "}
-                  You can restore it by moving the folder back into <code className="font-mono">app_data/projects</code>
-                  .
+                    ? `${annotated} annotated video${annotated === 1 ? "" : "s"} will disappear for everyone on the project.`
+                    : "The project will disappear for everyone."}{" "}
+                  Nothing is erased: it can be restored by clearing <code className="font-mono">deleted_at</code> on its
+                  row in <code className="font-mono">lemon.projects</code>.
                 </AlertDialogDescription>
               </AlertDialogHeader>
               <div className="grid gap-2">

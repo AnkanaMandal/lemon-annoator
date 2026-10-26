@@ -188,7 +188,7 @@ function DetailsContent({ projectId, d, missing }: { projectId: string; d: Video
         <Row label="Status" value={STATUS_LABEL[d.status]} />
         <Row label="Events" value={String(d.event_count)} />
         <Row label="Last saved" value={d.annotated_at ? new Date(d.annotated_at).toLocaleString() : "Never"} />
-        <Row label="Local file" value={d.annotation_file} mono copy />
+        <Row label="Last saved by" value={d.annotated_by} />
         <Row label="Session URL" value={d.streaming_url} mono copy truncate />
       </Section>
     </div>

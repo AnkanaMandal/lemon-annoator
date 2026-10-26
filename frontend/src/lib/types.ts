@@ -89,6 +89,7 @@ export interface VideoItem {
   status: VideoStatus;
   event_count: number;
   annotated_at: string | null;
+  annotated_by: string | null;
   missing: boolean;
 }
 
@@ -129,7 +130,7 @@ export interface VideoDetails {
   status: VideoStatus;
   event_count: number;
   annotated_at: string | null;
-  annotation_file: string | null;
+  annotated_by: string | null;
   streaming_url: string | null;
   duration_seconds: number | null;
 }
@@ -137,7 +138,29 @@ export interface VideoDetails {
 export interface ClearResult {
   key: string;
   cleared: boolean;
-  moved_to: string | null;
+}
+
+/** Someone with a video open (heartbeats from the annotation view). */
+export interface Presence {
+  user_id: string;
+  name: string;
+  video_key: string | null;
+  seen_at: string;
+}
+
+export interface VideoActivity {
+  status: VideoStatus;
+  event_count: number;
+  annotated_at: string;
+  annotated_by: string | null;
+  revision: number;
+}
+
+/** Saved status per annotated video and who is on which video; polled while annotating. */
+export interface ProjectActivity {
+  me: string;
+  videos: Record<string, VideoActivity>;
+  presence: Presence[];
 }
 
 export interface StreamUrl {
@@ -173,9 +196,14 @@ export interface VideoAnnotation {
   labels: Record<string, LabelValue>;
   created_at: string;
   updated_at: string;
+  /** Number of saves; sent back as base_revision so a stale save is refused. */
+  revision: number;
+  updated_by: string | null;
 }
 
 export interface AnnotationSave {
+  /** The revision the edits started from (0: nothing saved yet). */
+  base_revision: number;
   status: "in_progress" | "completed";
   events: AnnotationEvent[];
   labels: Record<string, LabelValue>;
@@ -196,7 +224,7 @@ export interface ConnectionTestResult {
 
 export interface ExportResult {
   filename: string;
-  path: string;
+  export_id: number;
   video_count: number;
   event_count: number;
   warnings: string[];

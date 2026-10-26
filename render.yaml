@@ -1,0 +1,26 @@
+# Render Blueprint for the Lemon API (FastAPI). Render > New > Blueprint > pick this repo.
+# Values marked `sync: false` are asked for when the Blueprint is created (see README "Deploy").
+services:
+  - type: web
+    name: lemon-api
+    runtime: python
+    plan: free # free instances sleep after 15 idle minutes; "starter" stays awake
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    # One process: the per-project locks are database advisory locks, but keep a single worker anyway.
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: LEMON_DATABASE_URL
+        sync: false
+      - key: LEMON_SUPABASE_URL
+        sync: false
+      - key: LEMON_ALLOWED_EMAILS
+        sync: false
+      - key: LEMON_CORS_ORIGINS
+        sync: false
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false

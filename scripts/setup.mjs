@@ -59,4 +59,7 @@ for (const [example, target] of [
   }
 }
 
-console.log("\n✔ Setup complete. Start the app with: npm run dev\n");
+console.log(
+  "\n✔ Setup complete. Fill in the Supabase values in backend/.env and frontend/.env.local (see README),\n" +
+    "  then start the app with: npm run dev\n",
+);

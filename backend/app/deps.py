@@ -1,13 +1,15 @@
 from functools import lru_cache
 
 from .config import get_settings
+from .db import Database
 from .models import Project, ProjectPublic, StoragePublic
 from .storage import ProjectStore
 
 
 @lru_cache
 def get_store() -> ProjectStore:
-    return ProjectStore(get_settings().data_dir)
+    settings = get_settings()
+    return ProjectStore(Database(settings.database_url, settings.db_schema))
 
 
 def to_public(project: Project, store: ProjectStore) -> ProjectPublic:

@@ -31,7 +31,7 @@ export function ExportButton({ projectId }: { projectId: string }) {
     onSuccess: (res) => {
       download(res.filename, res.data);
       toast.success(`Exported ${res.video_count} videos · ${res.event_count} events`, {
-        description: `Saved to ${res.path}`,
+        description: `A copy is kept in the database (export #${res.export_id}).`,
         duration: 8000,
       });
       for (const w of res.warnings) toast.warning(w, { duration: 10000 });
@@ -55,7 +55,7 @@ export function ExportButton({ projectId }: { projectId: string }) {
           <span className="sm:hidden">Export</span>
         </Button>
       </TooltipTrigger>
-      <TooltipContent>Writes app_data/projects/…/exports/*.json and downloads a copy</TooltipContent>
+      <TooltipContent>Downloads the project as JSON and keeps a copy in the database</TooltipContent>
     </Tooltip>
   );
 }

@@ -1,38 +1,34 @@
-"""Local JSON persistence under ./app_data.
+"""Persistence in Postgres (Supabase). Tables are created by db.py:
 
-Layout:
-    app_data/
-      projects/<project_id>/
-        project.json                 project config, credentials, label schema
-        annotations/_index.json      fast status lookup (self-healing cache of the files below)
-        annotations/<video>.json     one human-readable file per video
-        exports/<name>_<ts>.json     full project exports
-      .trash/                        deleted projects / cleared annotations are moved here, never erased
+    projects     one row per project; `data` holds the full Project (settings, credentials, schema)
+    annotations  one row per annotated video; `data` holds the VideoAnnotation, `revision` counts saves
+    presence     which video each signed-in user has open (heartbeats)
+    exports      every export that was written
 
-Concurrency: every read and write of a project's files happens under that project's lock. On
-Windows a file cannot be replaced while another handle has it open, so unlocked readers would
-make writers fail.
+Nothing is erased: deleting a project or clearing a video's annotations sets `deleted_at`, so the
+rows can be restored by clearing it again.
+
+Concurrency: `lock(project_id)` runs a transaction holding a per-project advisory lock, so
+read-modify-write sequences (by different users or requests) never interleave.
 """
 
-import hashlib
 import json
 import logging
-import os
 import re
 import secrets
-import tempfile
-import threading
-import time
-from collections import defaultdict
-from datetime import datetime
-from pathlib import Path
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 from typing import Any
 
+from psycopg.types.json import Jsonb
 from pydantic import ValidationError as PydanticValidationError
 
-from .errors import NotFoundError, StorageError, ValidationError
+from .db import Database
+from .errors import ConflictError, NotFoundError, StorageError, ValidationError
 from .models import (
     IndexEntry,
+    Presence,
     ProgressStats,
     Project,
     VideoAnnotation,
@@ -42,12 +38,8 @@ from .models import (
 log = logging.getLogger(__name__)
 
 PROJECT_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,80}")
-INDEX_FILE = "_index.json"
-
-# Short enough that <data_dir>/.trash/<project>/cleared-annotations/<name> stays under Windows'
-# 260-character path limit for ordinary install locations. The hash keeps names unique.
-READABLE_NAME_LEN = 40
-_WINDOWS_RESERVED = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(10)), *(f"lpt{i}" for i in range(10))}
+# A user counts as present on a video for this long after their last heartbeat.
+PRESENCE_TTL = timedelta(seconds=90)
 
 
 def slugify(value: str, max_len: int = 40) -> str:
@@ -55,352 +47,295 @@ def slugify(value: str, max_len: int = 40) -> str:
     return slug[:max_len].strip("-") or "project"
 
 
-def video_file_name(key: str) -> str:
-    """Readable, collision-free filename for an arbitrary S3 key (used for newly saved videos;
-    existing files keep their name and are found through the index)."""
-    readable = re.sub(r"[^A-Za-z0-9._-]+", "_", key)[-READABLE_NAME_LEN:].strip("._-") or "video"
-    if readable.split(".")[0].lower() in _WINDOWS_RESERVED:
-        readable = f"_{readable}"
-    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:10]
-    return f"{readable}-{digest}.json"
-
-
 def timestamp() -> str:
     """Filename-safe UTC timestamp with milliseconds."""
     return utcnow().strftime("%Y%m%d-%H%M%S-%f")[:-3]
 
 
-def unique_path(path: Path) -> Path:
-    candidate, n = path, 2
-    while candidate.exists():
-        candidate = path.with_name(f"{path.stem}-{n}{path.suffix}")
-        n += 1
-    return candidate
-
-
-def _json_default(obj: Any) -> Any:
+def json_default(obj: Any) -> Any:
     if isinstance(obj, datetime):
         return obj.isoformat()
     raise TypeError(f"Not JSON serializable: {type(obj)!r}")
 
 
-def _retry_on_lock(action, attempts: int = 12) -> None:
-    """Windows refuses to replace/move a file that another process (antivirus, indexer, editor)
-    briefly holds open. Retry with backoff for ~3 seconds before giving up."""
-    for attempt in range(attempts):
-        try:
-            action()
-            return
-        except PermissionError:
-            if attempt == attempts - 1:
-                raise
-            time.sleep(min(0.05 * 2**attempt, 0.5))
-
-
-def write_json_atomic(path: Path, data: Any, *, create_dirs: bool = False) -> None:
-    """Write via temp file + rename so a crash never leaves a half-written file.
-
-    Directories are only created when `create_dirs` is set, so a write can never resurrect the
-    folder of a project that was deleted meanwhile."""
-    if create_dirs:
-        path.parent.mkdir(parents=True, exist_ok=True)
-    elif not path.parent.is_dir():
-        raise StorageError(f"Folder {path.parent} no longer exists.", code="LOCAL_DIR_MISSING")
-    payload = json.dumps(data, indent=2, ensure_ascii=False, default=_json_default)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-", suffix=".part")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(payload)
-            fh.write("\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        _retry_on_lock(lambda: os.replace(tmp, path))
-    except OSError as exc:
-        raise StorageError(
-            f"Could not write {path.name}: {exc.strerror or exc}",
-            hint=f"Check that {path.parent} is writable and the file isn't open in another program.",
-        ) from exc
-    finally:
-        if os.path.exists(tmp):
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-
-
-def move_to(src: Path, dest: Path) -> None:
-    """Atomic rename within app_data (same volume). Never falls back to copy-then-delete, which
-    could leave a half-moved folder if a file is open."""
-    try:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        _retry_on_lock(lambda: os.replace(src, dest))
-    except OSError as exc:
-        raise StorageError(
-            f"Could not move {src.name}: {exc.strerror or exc}",
-            hint="Close any program that has files in this project open, then try again.",
-        ) from exc
-
-
-def read_json(path: Path) -> Any:
-    try:
-        with path.open("r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except json.JSONDecodeError as exc:
-        raise StorageError(
-            f"{path.name} is not valid JSON (line {exc.lineno}, column {exc.colno}).",
-            code="LOCAL_FILE_CORRUPT",
-            hint=f"Fix or remove the file: {path}",
-        ) from exc
-    except OSError as exc:
-        raise StorageError(f"Could not read {path.name}: {exc.strerror or exc}") from exc
+def _jsonb(data: Any) -> Jsonb:
+    return Jsonb(data, dumps=lambda obj: json.dumps(obj, default=json_default))
 
 
 class ProjectStore:
-    def __init__(self, root: Path) -> None:
-        self.root = root
-        self.projects_dir = root / "projects"
-        self.trash_dir = root / ".trash"
-        self._locks: defaultdict[str, threading.RLock] = defaultdict(threading.RLock)
-        self._locks_guard = threading.Lock()
-        try:
-            self.projects_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise StorageError(f"Cannot create data directory {root}: {exc}") from exc
+    def __init__(self, db: Database) -> None:
+        self.db = db
+        self.projects = db.table("projects")
+        self.annotations = db.table("annotations")
+        self.presence = db.table("presence")
+        self.exports = db.table("exports")
 
     # ----------------------------------------------------------------- utils
-    def lock(self, project_id: str) -> threading.RLock:
-        with self._locks_guard:
-            return self._locks[project_id]
+    @contextmanager
+    def lock(self, project_id: str) -> Iterator[None]:
+        with self.db.transaction() as conn:
+            conn.execute("select pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"lemon:{project_id}",))
+            yield
 
-    def _project_dir(self, project_id: str) -> Path:
+    def _require_project(self, project_id: str) -> None:
         if not PROJECT_ID_RE.fullmatch(project_id):
             raise NotFoundError(f"Project '{project_id}' not found")
-        return self.projects_dir / project_id
-
-    def _require_project(self, project_id: str) -> Path:
-        path = self._project_dir(project_id)
-        if not (path / "project.json").is_file():
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                f"select 1 from {self.projects} where id = %s and deleted_at is null", (project_id,)
+            ).fetchone()
+        if not row:
             raise NotFoundError(f"Project '{project_id}' not found")
-        return path
-
-    def _annotations_dir(self, project_id: str) -> Path:
-        ann_dir = self._require_project(project_id) / "annotations"
-        ann_dir.mkdir(exist_ok=True)
-        return ann_dir
 
     # -------------------------------------------------------------- projects
     def list_projects(self) -> list[Project]:
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                f"select id, data from {self.projects} where deleted_at is null order by updated_at desc"
+            ).fetchall()
         projects = []
-        for child in sorted(self.projects_dir.iterdir()):
-            if not child.is_dir() or not (child / "project.json").exists():
-                continue
+        for row in rows:
             try:
-                projects.append(self.get(child.name))
-            except Exception as exc:  # one bad file must not hide every project
-                log.warning("Skipping project %s: %s", child.name, exc)
-        projects.sort(key=lambda p: p.updated_at, reverse=True)
+                projects.append(Project.model_validate(row["data"]))
+            except PydanticValidationError as exc:  # one bad row must not hide every project
+                log.warning("Skipping project %s: %s", row["id"], exc)
         return projects
 
     def get(self, project_id: str) -> Project:
-        with self.lock(project_id):
-            path = self._require_project(project_id) / "project.json"
-            raw = read_json(path)
+        if not PROJECT_ID_RE.fullmatch(project_id):
+            raise NotFoundError(f"Project '{project_id}' not found")
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                f"select data from {self.projects} where id = %s and deleted_at is null", (project_id,)
+            ).fetchone()
+        if not row:
+            raise NotFoundError(f"Project '{project_id}' not found")
         try:
-            return Project.model_validate(raw)
+            return Project.model_validate(row["data"])
         except PydanticValidationError as exc:
             raise StorageError(
-                f"project.json for '{project_id}' has invalid content.",
+                f"The stored settings of project '{project_id}' are invalid.",
                 code="LOCAL_FILE_CORRUPT",
                 hint=str(exc.errors()[0].get("msg")) if exc.errors() else None,
             ) from exc
 
     def create(self, name: str, description: str = "") -> Project:
         base = slugify(name)
-        for _ in range(10):
-            project_id = f"{base}-{secrets.token_hex(3)}"
-            if not (self.projects_dir / project_id).exists():
-                break
-        else:  # pragma: no cover
-            raise StorageError("Could not allocate a project id")
-        project = Project(id=project_id, name=name.strip(), description=description.strip())
-        with self.lock(project_id):
-            project_dir = self.projects_dir / project_id
-            (project_dir / "annotations").mkdir(parents=True, exist_ok=True)
-            write_json_atomic(project_dir / "project.json", project.model_dump(mode="json"))
-        return project
+        with self.db.transaction() as conn:
+            for _ in range(10):
+                project = Project(id=f"{base}-{secrets.token_hex(3)}", name=name.strip(), description=description.strip())
+                inserted = conn.execute(
+                    f"insert into {self.projects} (id, data, created_at, updated_at) values (%s, %s, %s, %s) "
+                    "on conflict (id) do nothing returning id",
+                    (project.id, _jsonb(project.model_dump(mode="json")), project.created_at, project.updated_at),
+                ).fetchone()
+                if inserted:
+                    return project
+        raise StorageError("Could not allocate a project id")  # pragma: no cover
 
     def save(self, project: Project, touch: bool = True) -> Project:
         if touch:
             project.updated_at = utcnow()
-        with self.lock(project.id):
-            path = self._require_project(project.id) / "project.json"
-            write_json_atomic(path, project.model_dump(mode="json"))
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                f"update {self.projects} set data = %s, updated_at = %s where id = %s and deleted_at is null",
+                (_jsonb(project.model_dump(mode="json")), project.updated_at, project.id),
+            )
+        if cur.rowcount == 0:
+            raise NotFoundError(f"Project '{project.id}' not found")
         return project
 
-    def delete(self, project_id: str) -> Path:
-        with self.lock(project_id):
-            src = self._require_project(project_id)
-            dest = unique_path(self.trash_dir / f"{project_id}_{timestamp()}")
-            move_to(src, dest)
-        return dest
+    def delete(self, project_id: str) -> datetime:
+        if not PROJECT_ID_RE.fullmatch(project_id):
+            raise NotFoundError(f"Project '{project_id}' not found")
+        now = utcnow()
+        with self.lock(project_id), self.db.transaction() as conn:
+            cur = conn.execute(
+                f"update {self.projects} set deleted_at = %s where id = %s and deleted_at is null", (now, project_id)
+            )
+        if cur.rowcount == 0:
+            raise NotFoundError(f"Project '{project_id}' not found")
+        return now
 
     # ----------------------------------------------------------- annotations
-    def annotation_path(self, project_id: str, key: str, index: dict[str, IndexEntry] | None = None) -> Path:
-        """Where this video's annotations live: the indexed file if there is one (older files use a
-        longer naming scheme), otherwise the standard name."""
-        with self.lock(project_id):
-            ann_dir = self._annotations_dir(project_id)
-            entry = (index if index is not None else self.load_index(project_id)).get(key)
-            if entry and (ann_dir / entry.file).is_file():
-                return ann_dir / entry.file
-            return ann_dir / video_file_name(key)
-
-    def get_annotation(self, project_id: str, key: str) -> VideoAnnotation | None:
-        with self.lock(project_id):
-            path = self.annotation_path(project_id, key)
-            if not path.exists():
-                return None
-            raw = read_json(path)
+    def _to_annotation(self, row: dict, key: str) -> VideoAnnotation:
         try:
-            return VideoAnnotation.model_validate(raw)
+            ann = VideoAnnotation.model_validate(row["data"])
         except PydanticValidationError as exc:
             raise StorageError(
-                f"Annotation file for '{key}' has invalid content.",
+                f"The saved annotations for '{key}' are invalid.",
                 code="LOCAL_FILE_CORRUPT",
-                hint=f"Fix or remove {path}",
+                hint="Clear this video's annotations to start again (the old row is kept).",
             ) from exc
+        ann.revision = row["revision"]
+        ann.updated_by = row["updated_by"]
+        return ann
 
-    def quarantine_annotation(self, project_id: str, key: str) -> Path | None:
-        """Move an unreadable annotation file to the trash so the video can be saved again."""
-        with self.lock(project_id):
-            src = self.annotation_path(project_id, key)
-            if not src.exists():
-                return None
-            dest = unique_path(self.trash_dir / project_id / "corrupt-annotations" / f"{src.stem}_{timestamp()}.json")
-            move_to(src, dest)
-            log.warning("Moved unreadable annotation %s to %s", src.name, dest)
-            return dest
+    def get_annotation(self, project_id: str, key: str) -> VideoAnnotation | None:
+        self._require_project(project_id)
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                f"select data, revision, updated_by from {self.annotations} "
+                "where project_id = %s and video_key = %s and deleted_at is null",
+                (project_id, key),
+            ).fetchone()
+        return self._to_annotation(row, key) if row else None
 
-    def clear_annotation(self, project_id: str, key: str) -> Path | None:
-        """Remove a video's saved annotations. The file is moved to app_data/.trash, never erased.
-        Returns where it went, or None if nothing was saved."""
-        with self.lock(project_id):
-            index = self.load_index(project_id)
-            src = self.annotation_path(project_id, key, index)
-            dest = None
-            if src.exists():
-                dest = unique_path(
-                    self.trash_dir / project_id / "cleared-annotations" / f"{src.stem}_{timestamp()}.json"
-                )
-                move_to(src, dest)
-            if index.pop(key, None) is not None or dest:
-                self._write_index(project_id, index)
-        return dest
+    def _retire(self, project_id: str, key: str, by: str | None) -> bool:
+        """Mark the live row of a video as deleted (it stays in the table)."""
+        with self.lock(project_id), self.db.transaction() as conn:
+            cur = conn.execute(
+                f"update {self.annotations} set deleted_at = %s, deleted_by = %s "
+                "where project_id = %s and video_key = %s and deleted_at is null",
+                (utcnow(), by, project_id, key),
+            )
+        return cur.rowcount > 0
 
-    def save_annotation(self, project_id: str, annotation: VideoAnnotation) -> VideoAnnotation:
+    def quarantine_annotation(self, project_id: str, key: str) -> bool:
+        """Set an unreadable annotation aside so the video can be saved again."""
+        retired = self._retire(project_id, key, "lemon:unreadable")
+        if retired:
+            log.warning("Set aside unreadable annotations for %s in %s", key, project_id)
+        return retired
+
+    def clear_annotation(self, project_id: str, key: str, by: str | None = None) -> bool:
+        """Remove a video's saved annotations (the row is kept, marked deleted). False if none."""
+        self._require_project(project_id)
+        return self._retire(project_id, key, by)
+
+    def save_annotation(
+        self,
+        project_id: str,
+        annotation: VideoAnnotation,
+        *,
+        base_revision: int | None = None,
+        user: str | None = None,
+    ) -> VideoAnnotation:
         if not annotation.video_key:
             raise ValidationError("video_key is required")
-        with self.lock(project_id):
-            index = self.load_index(project_id)
-            path = self.annotation_path(project_id, annotation.video_key, index)
-            write_json_atomic(path, annotation.model_dump(mode="json"))
-            index[annotation.video_key] = IndexEntry(
-                status=annotation.status,
-                event_count=len(annotation.events),
-                updated_at=annotation.updated_at,
-                file=path.name,
-                bucket=annotation.bucket,
-            )
-            self._write_index(project_id, index)
+        key = annotation.video_key
+        data = _jsonb(annotation.model_dump(mode="json", exclude={"revision", "updated_by"}))
+        with self.lock(project_id), self.db.transaction() as conn:
+            self._require_project(project_id)
+            current = conn.execute(
+                f"select id, revision, updated_by, updated_at from {self.annotations} "
+                "where project_id = %s and video_key = %s and deleted_at is null",
+                (project_id, key),
+            ).fetchone()
+            if base_revision is not None and (current["revision"] if current else 0) != base_revision:
+                raise self._conflict(current)
+            values = (annotation.bucket, annotation.status, len(annotation.events), data, annotation.updated_at, user)
+            if current:
+                row = conn.execute(
+                    f"update {self.annotations} set bucket = %s, status = %s, event_count = %s, data = %s, "
+                    "updated_at = %s, updated_by = %s, revision = revision + 1 where id = %s returning revision",
+                    (*values, current["id"]),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    f"insert into {self.annotations} "
+                    "(project_id, video_key, bucket, status, event_count, data, updated_at, updated_by) "
+                    "values (%s, %s, %s, %s, %s, %s, %s, %s) returning revision",
+                    (project_id, key, *values),
+                ).fetchone()
+        annotation.revision = row["revision"]
+        annotation.updated_by = user
         return annotation
 
-    def load_index(self, project_id: str) -> dict[str, IndexEntry]:
-        """Status of every annotated video. Rebuilt from the files whenever it is missing, corrupt
-        or out of sync with them (e.g. a file restored from .trash, or an interrupted save)."""
-        with self.lock(project_id):
-            ann_dir = self._annotations_dir(project_id)
-            path = ann_dir / INDEX_FILE
-            if path.exists():
-                try:
-                    raw = read_json(path)
-                    index = {k: IndexEntry.model_validate(v) for k, v in raw.items()}
-                    on_disk = {
-                        e.name
-                        for e in os.scandir(ann_dir)
-                        if e.is_file() and e.name.endswith(".json") and e.name != INDEX_FILE and not e.name.startswith(".")
-                    }
-                    if on_disk == {entry.file for entry in index.values()}:
-                        return index
-                    log.info("Index for %s is out of sync with its files; rebuilding", project_id)
-                except (StorageError, PydanticValidationError, AttributeError) as exc:
-                    log.warning("Rebuilding corrupt index for %s: %s", project_id, exc)
-            return self._rebuild_index(project_id)
-
-    def _rebuild_index(self, project_id: str) -> dict[str, IndexEntry]:
-        ann_dir = self._annotations_dir(project_id)
-        index: dict[str, IndexEntry] = {}
-        for file in sorted(ann_dir.glob("*.json")):
-            if file.name == INDEX_FILE or file.name.startswith("."):
-                continue
-            try:
-                ann = VideoAnnotation.model_validate(read_json(file))
-            except Exception as exc:
-                log.warning("Ignoring unreadable annotation %s: %s", file.name, exc)
-                continue
-            index[ann.video_key] = IndexEntry(
-                status=ann.status,
-                event_count=len(ann.events),
-                updated_at=ann.updated_at,
-                file=file.name,
-                bucket=ann.bucket,
+    @staticmethod
+    def _conflict(current: dict | None) -> ConflictError:
+        if current is None:
+            return ConflictError(
+                "This video's annotations were cleared after you opened it.",
+                code="ANNOTATION_CONFLICT",
+                hint="Reload to start from the cleared state, or keep your version to save it again.",
+                details={"revision": 0, "updated_by": None, "updated_at": None},
             )
-        self._write_index(project_id, index)
-        return index
+        who = current["updated_by"] or "Someone else"
+        return ConflictError(
+            f"{who} saved this video after you opened it.",
+            code="ANNOTATION_CONFLICT",
+            hint="Load their version, or keep yours and overwrite it.",
+            details={
+                "revision": current["revision"],
+                "updated_by": current["updated_by"],
+                "updated_at": current["updated_at"].isoformat(),
+            },
+        )
 
-    def _write_index(self, project_id: str, index: dict[str, IndexEntry]) -> None:
-        data = {k: v.model_dump(mode="json") for k, v in sorted(index.items())}
-        write_json_atomic(self._annotations_dir(project_id) / INDEX_FILE, data)
+    def load_index(self, project_id: str) -> dict[str, IndexEntry]:
+        """Status of every annotated video in the project."""
+        self._require_project(project_id)
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                f"select video_key, status, event_count, updated_at, bucket, revision, updated_by "
+                f"from {self.annotations} where project_id = %s and deleted_at is null",
+                (project_id,),
+            ).fetchall()
+        return {r["video_key"]: IndexEntry(**{k: v for k, v in r.items() if k != "video_key"}) for r in rows}
 
     def iter_annotations(self, project_id: str) -> tuple[list[VideoAnnotation], list[str]]:
-        """All readable annotations, plus a warning for each file that could not be read."""
+        """All readable annotations, plus a warning for each one that could not be read."""
+        self._require_project(project_id)
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                f"select video_key, data, revision, updated_by from {self.annotations} "
+                "where project_id = %s and deleted_at is null order by video_key",
+                (project_id,),
+            ).fetchall()
         out: list[VideoAnnotation] = []
         warnings: list[str] = []
-        with self.lock(project_id):
-            for key in self.load_index(project_id):
-                try:
-                    ann = self.get_annotation(project_id, key)
-                except StorageError as exc:
-                    warnings.append(f"Skipped {key}: {exc.message}")
-                    continue
-                if ann:
-                    out.append(ann)
+        for row in rows:
+            try:
+                out.append(self._to_annotation(row, row["video_key"]))
+            except StorageError as exc:
+                warnings.append(f"Skipped {row['video_key']}: {exc.message}")
         return out, warnings
 
     def stats(self, project: Project) -> ProgressStats:
         """Progress of what the queue shows: the current bucket and folder. Annotations left from an
-        earlier folder stay on disk but are not counted against this folder's videos."""
-        stats = ProgressStats()
-        try:
-            index = self.load_index(project.id)
-        except (StorageError, NotFoundError):
-            return stats
-        prefix = project.storage.normalized_prefix
-        for key, entry in index.items():
-            if entry.status in ("completed", "in_progress"):
-                stats.all_annotated += 1
-            if entry.bucket not in (None, project.storage.bucket) or not key.startswith(prefix):
-                continue
-            if entry.status == "completed":
-                stats.completed += 1
-            elif entry.status == "in_progress":
-                stats.in_progress += 1
-            stats.total_events += entry.event_count
-        return stats
+        earlier folder stay saved but are not counted against this folder's videos (all_annotated
+        counts them: everything that deleting the project removes)."""
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "select count(*) filter (where status in ('completed', 'in_progress')) as all_annotated, "
+                "count(*) filter (where here and status = 'completed') as completed, "
+                "count(*) filter (where here and status = 'in_progress') as in_progress, "
+                "coalesce(sum(event_count) filter (where here), 0) as total_events "
+                "from (select status, event_count, (bucket is null or bucket = %s) and starts_with(video_key, %s) "
+                f"as here from {self.annotations} where project_id = %s and deleted_at is null) as a",
+                (project.storage.bucket, project.storage.normalized_prefix, project.id),
+            ).fetchone()
+        return ProgressStats(**row)
+
+    # -------------------------------------------------------------- presence
+    def touch_presence(self, project_id: str, user_id: str, name: str, key: str | None) -> None:
+        self._require_project(project_id)
+        with self.db.transaction() as conn:
+            conn.execute(
+                f"insert into {self.presence} (project_id, user_id, user_name, video_key, seen_at) "
+                "values (%s, %s, %s, %s, %s) on conflict (project_id, user_id) do update set "
+                "user_name = excluded.user_name, video_key = excluded.video_key, seen_at = excluded.seen_at",
+                (project_id, user_id, name, key, utcnow()),
+            )
+
+    def list_presence(self, project_id: str) -> list[Presence]:
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                f"select user_id, user_name as name, video_key, seen_at from {self.presence} "
+                "where project_id = %s and seen_at > %s and video_key is not null order by user_name",
+                (project_id, utcnow() - PRESENCE_TTL),
+            ).fetchall()
+        return [Presence(**r) for r in rows]
 
     # --------------------------------------------------------------- exports
-    def write_export(self, project: Project, data: dict) -> Path:
-        with self.lock(project.id):
-            exports = self._require_project(project.id) / "exports"
-            path = unique_path(exports / f"{slugify(project.name)}_{timestamp()}.json")
-            write_json_atomic(path, data, create_dirs=True)
-        return path
+    def write_export(self, project: Project, data: dict, user: str | None = None) -> tuple[int, str]:
+        filename = f"{slugify(project.name)}_{timestamp()}.json"
+        with self.db.transaction() as conn:
+            self._require_project(project.id)
+            row = conn.execute(
+                f"insert into {self.exports} (project_id, filename, created_at, created_by, data) "
+                "values (%s, %s, %s, %s, %s) returning id",
+                (project.id, filename, utcnow(), user, _jsonb(data)),
+            ).fetchone()
+        return row["id"], filename

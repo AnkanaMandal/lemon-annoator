@@ -1,10 +1,20 @@
 "use client";
 
 import { useQueryClient } from "@tanstack/react-query";
-import { ChevronDown, ChevronUp, CloudOff, ExternalLink, FolderSearch, Keyboard, Settings2 } from "lucide-react";
+import {
+  AlertTriangle,
+  ChevronDown,
+  ChevronUp,
+  CloudOff,
+  ExternalLink,
+  FolderSearch,
+  Keyboard,
+  Settings2,
+  Users,
+} from "lucide-react";
 import Link from "next/link";
 import { useParams, useSearchParams } from "next/navigation";
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { toast } from "sonner";
 
 import { ClearAnnotationsDialog } from "@/components/annotate/clear-annotations-dialog";
@@ -27,13 +37,15 @@ import { useHydrated } from "@/hooks/use-hydrated";
 import {
   keys,
   streamUrlQuery,
+  useActivity,
   useAnnotation,
   useProject,
   useSaveAnnotation,
   useStreamUrl,
   useVideos,
+  withActivity,
 } from "@/hooks/queries";
-import { api, errorMessage } from "@/lib/api";
+import { api, errorMessage, isConflict } from "@/lib/api";
 import { eventColor } from "@/lib/colors";
 import { formatTime, frameAt, newId } from "@/lib/format";
 import { pendingSave } from "@/lib/pending-save";
@@ -56,6 +68,7 @@ import type {
   AnnotationEvent,
   LabelValue,
   Project,
+  ProjectActivity,
   StreamUrl,
   VideoAnnotation,
   VideoItem,
@@ -175,12 +188,25 @@ const sortEvents = (evs: AnnotationEvent[]) =>
 
 const round3 = (n: number) => Math.round(n * 1000) / 1000;
 
-/** Next video that still needs work, searching forward from `current` and wrapping. */
-function findNextTodo(videos: VideoItem[], current: string | null): string | null {
+/** Next video that still needs work and nobody else has open, searching forward from `current` and wrapping. */
+function findNextTodo(videos: VideoItem[], current: string | null, busy: Map<string, string[]>): string | null {
   const i = videos.findIndex((v) => v.key === current);
   const order = [...videos.slice(i + 1), ...videos.slice(0, Math.max(i, 0))];
-  return order.find((v) => v.status !== "completed" && !v.missing)?.key ?? null;
+  return order.find((v) => v.status !== "completed" && !v.missing && !busy.has(v.key))?.key ?? null;
 }
+
+/** Video key -> names of the other people who have it open. */
+function othersByVideo(activity: ProjectActivity | undefined): Map<string, string[]> {
+  const map = new Map<string, string[]>();
+  for (const p of activity?.presence ?? []) {
+    if (p.user_id === activity!.me || !p.video_key) continue;
+    map.set(p.video_key, [...(map.get(p.video_key) ?? []), p.name]);
+  }
+  return map;
+}
+
+const joinNames = (names: string[]) =>
+  names.length <= 2 ? names.join(" and ") : `${names.slice(0, -1).join(", ")} and ${names.at(-1)}`;
 
 const lastVideoKey = (projectId: string) => `lemon.last-video.${projectId}`;
 
@@ -268,19 +294,27 @@ function Workspace({
   const projectId = project.id;
   const schema = project.label_schema;
   const { fps, skip_seconds: skipSeconds } = project.settings;
-  const videos = list.videos;
 
   const playerRef = useRef<PlayerHandle>(null);
   const [timeStore] = useState(createTimeStore);
   const prefs = useSyncExternalStore(prefsStore.subscribe, prefsStore.read, () => DEFAULT_PREFS);
 
   const [activeKey, setActiveKey] = useState<string | null>(() =>
-    pickInitial(videos, initialKey ?? readLastVideo(project.id)),
+    pickInitial(list.videos, initialKey ?? readLastVideo(project.id)),
   );
   const activeKeyRef = useRef(activeKey);
   useEffect(() => {
     activeKeyRef.current = activeKey;
   }, [activeKey]);
+
+  // The other person's saves and whereabouts, polled (also announces which video this user has open).
+  const activityQ = useActivity(projectId, activeKey);
+  const videos = useMemo(
+    () => withActivity(list.videos, activityQ.data?.videos),
+    [list.videos, activityQ.data?.videos],
+  );
+  const othersOn = useMemo(() => othersByVideo(activityQ.data), [activityQ.data]);
+  const othersHere = activeKey ? (othersOn.get(activeKey) ?? []) : [];
 
   const urlQ = useStreamUrl(projectId, activeKey);
   const annQ = useAnnotation(projectId, activeKey);
@@ -295,6 +329,14 @@ function Workspace({
   const versionRef = useRef(0);
   /** versionRef value covered by the last successful save (nothing newer to write when equal). */
   const savedVersionRef = useRef(0);
+  /** Server revision these edits are based on; a save from an older one is refused (conflict). */
+  const baseRevisionRef = useRef(0);
+  const [adopted, setAdopted] = useState<{ revision: number } | null>(null);
+  useEffect(() => {
+    if (adopted) baseRevisionRef.current = adopted.revision;
+  }, [adopted]);
+  /** Someone else saved (or cleared) this video since it was opened; saving waits for a choice. */
+  const [conflict, setConflict] = useState<{ message: string; revision: number } | null>(null);
 
   const [draft, setDraft] = useState<DraftValues>(() => emptyDraft(schema));
   const [draftSchema, setDraftSchema] = useState(schema);
@@ -314,9 +356,12 @@ function Workspace({
   const [mediaError, setMediaError] = useState<string | null>(null);
   const lastRefresh = useRef<{ key: string; at: number } | null>(null);
 
-  // Adopt server data once per video switch (derived-state pattern, no effect needed).
-  if (activeKey && annQ.isSuccess && loadedKey !== activeKey) {
+  // Adopt server data once per video switch (derived-state pattern, no effect needed). Wait for the
+  // refetch to finish so a cached copy never becomes the base of new edits.
+  if (activeKey && annQ.isSuccess && annQ.fetchStatus === "idle" && loadedKey !== activeKey) {
     setLoadedKey(activeKey);
+    setAdopted({ revision: annQ.data?.revision ?? 0 });
+    setConflict(null);
     setEvents(sortEvents(annQ.data?.events ?? []));
     setLabels(withLabelDefaults(schema, annQ.data?.labels));
     setDirty(false);
@@ -359,6 +404,7 @@ function Workspace({
     setPreEditDraft(null);
     setMediaError(null);
     setDirty(false);
+    setConflict(null);
     setShowRequired(false);
     if (!prefs.keepValues) setDraft(emptyDraft(schema));
     window.history.replaceState(null, "", `?v=${encodeURIComponent(key)}`);
@@ -383,17 +429,11 @@ function Workspace({
     if (next) requestSwitch(next.key);
   };
 
-  // Warm up the next video so Save & Next is instant.
+  // Warm up the next video's stream so Save & Next is quick. (Its annotations are always refetched.)
   useEffect(() => {
-    const next = findNextTodo(videos, activeKey);
-    if (!next) return;
-    qc.prefetchQuery(streamUrlQuery(projectId, next));
-    qc.prefetchQuery({
-      queryKey: keys.annotation(projectId, next),
-      queryFn: () => api.getAnnotation(projectId, next),
-      staleTime: Infinity,
-    });
-  }, [activeKey, videos, projectId, qc]);
+    const next = findNextTodo(videos, activeKey, othersOn);
+    if (next) qc.prefetchQuery(streamUrlQuery(projectId, next));
+  }, [activeKey, videos, othersOn, projectId, qc]);
 
   /* -------------------------------- saving ------------------------------- */
 
@@ -423,6 +463,7 @@ function Workspace({
       const saved = await saveMut.mutateAsync({
         key,
         body: {
+          base_revision: baseRevisionRef.current,
           status,
           events,
           labels,
@@ -431,6 +472,7 @@ function Workspace({
           duration_seconds: playerRef.current?.getDuration() || null,
         },
       });
+      if (activeKeyRef.current === key) baseRevisionRef.current = saved.revision;
       // Only mark clean if nothing changed while the request was in flight.
       savedVersionRef.current = Math.max(savedVersionRef.current, version);
       if (versionRef.current === version && activeKeyRef.current === key) {
@@ -444,9 +486,36 @@ function Workspace({
       return saved;
     } catch (err) {
       const { title, hint } = errorMessage(err);
-      toast.error(`Save failed: ${title}`, { description: hint ?? undefined });
+      if (isConflict(err) && activeKeyRef.current === key) {
+        setConflict({ message: title, revision: Number(err.details.revision ?? 0) });
+        toast.error(title, { description: "Not saved. Choose which version to keep above the player." });
+      } else {
+        toast.error(`Save failed: ${title}`, { description: hint ?? undefined });
+      }
       throw err;
     }
+  };
+
+  /** Drop local edits and load what is saved now (after a conflict, or when someone else saved). */
+  const reloadFromServer = () => {
+    const key = activeKeyRef.current;
+    if (!key) return;
+    setConflict(null);
+    setDirty(false);
+    savedVersionRef.current = versionRef.current;
+    pendingSave.register(projectId, null);
+    setLoadedKey(null);
+    void qc.resetQueries({ queryKey: keys.annotation(projectId, key), exact: true });
+  };
+
+  /** Resolve a conflict by saving these edits over the newer version. */
+  const keepMine = () => {
+    if (!conflict) return;
+    baseRevisionRef.current = conflict.revision;
+    setConflict(null);
+    save("save")
+      .then(() => toast.success("Saved your version"))
+      .catch(() => {});
   };
 
   const saveOnly = () => {
@@ -491,8 +560,11 @@ function Workspace({
       toast.info("Saved. You made changes while saving, so you're still on this video.");
       return;
     }
-    const latest = qc.getQueryData<VideoList>(keys.videos(projectId))?.videos ?? videos;
-    const next = findNextTodo(latest, current);
+    const latest = withActivity(
+      qc.getQueryData<VideoList>(keys.videos(projectId))?.videos ?? list.videos,
+      qc.getQueryData<ProjectActivity>(keys.activity(projectId))?.videos,
+    );
+    const next = findNextTodo(latest, current, othersOn);
     if (next) {
       doSwitch(next);
       toast.success("Saved — next video", { duration: 1500 });
@@ -510,14 +582,33 @@ function Workspace({
   useEffect(() => {
     saveRef.current = save;
     flushRef.current = () => {
-      if (dirty && ready) save("save").catch(() => {});
+      if (dirty && ready && !conflict) save("save").catch(() => {});
     };
   });
   useEffect(() => {
-    if (!dirty || !ready) return;
+    if (!dirty || !ready || conflict) return;
     const id = setTimeout(() => saveRef.current("save").catch(() => {}), AUTOSAVE_MS);
     return () => clearTimeout(id);
-  }, [dirty, ready, events, labels]);
+  }, [dirty, ready, conflict, events, labels]);
+
+  // Someone else saved or cleared this video while it is open here with nothing unsaved: show their
+  // version. (With unsaved edits, the next save reports a conflict instead.)
+  const serverRevision = activeKey && activityQ.data ? (activityQ.data.videos[activeKey]?.revision ?? 0) : null;
+  const serverEditor = activeKey ? activityQ.data?.videos[activeKey]?.annotated_by : null;
+  useEffect(() => {
+    if (serverRevision === null || !ready || dirty || conflict || editingId || saveMut.isPending) return;
+    const base = baseRevisionRef.current;
+    if (serverRevision > base || (serverRevision === 0 && base > 0)) {
+      reloadFromServer();
+      toast.info(
+        serverRevision ? `${serverEditor ?? "Someone"} updated this video` : "This video's annotations were cleared",
+        {
+          description: "Showing the latest saved version.",
+        },
+      );
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- reacts to new server revisions only
+  }, [serverRevision, ready, dirty, conflict, editingId, saveMut.isPending]);
   // Leaving the Annotate view (another tab of the app) or unmounting saves immediately.
   useEffect(() => () => flushRef.current(), []);
 
@@ -668,10 +759,10 @@ function Workspace({
       throw new Error("save in progress");
     }
     await qc.cancelQueries({ queryKey: keys.annotation(projectId, video.key) });
-    let movedTo: string | null = null;
+    let cleared = false;
     if (video.status !== "not_started" || video.event_count > 0) {
       try {
-        movedTo = (await api.clearAnnotation(projectId, video.key)).moved_to;
+        cleared = (await api.clearAnnotation(projectId, video.key)).cleared;
       } catch (err) {
         const { title, hint } = errorMessage(err);
         toast.error(`Couldn't clear annotations: ${title}`, { description: hint ?? undefined });
@@ -694,21 +785,29 @@ function Workspace({
           }
         : prev,
     );
+    qc.setQueryData<ProjectActivity>(keys.activity(projectId), (prev) => {
+      if (!prev) return prev;
+      const videos = { ...prev.videos };
+      delete videos[video.key];
+      return { ...prev, videos };
+    });
     qc.invalidateQueries({ queryKey: keys.projects, exact: true });
     if (video.key === activeKeyRef.current) {
       setLabels(withLabelDefaults(schema, undefined));
       setEvents([]);
       setDirty(false);
+      setConflict(null);
+      baseRevisionRef.current = 0;
       pendingSave.register(projectId, null);
       setEditingId(null);
       setPreEditDraft(null);
       // New version so an in-flight save can't restore the old events, but nothing left to save:
-      // a later Save must not write an empty "in progress" file for the video just cleared.
+      // a later Save must not write an empty "in progress" row for the video just cleared.
       versionRef.current++;
       savedVersionRef.current = versionRef.current;
     }
     toast.success(`Cleared annotations for ${video.filename}`, {
-      description: movedTo ? `Previous file moved to ${movedTo}` : undefined,
+      description: cleared ? "A copy is kept in the database." : undefined,
     });
   };
 
@@ -881,6 +980,7 @@ function Workspace({
             onOpenVideo={openVideoInTab}
             onClear={setClearVideo}
             storageKey={`lemon.queue.${projectId}`}
+            othersOn={othersOn}
           />
         </div>
         {!prefs.queueOpen && <QueueRail completed={completedCount} total={videos.length} onExpand={toggleQueue} />}
@@ -896,6 +996,11 @@ function Workspace({
               {status === "completed" && (
                 <Badge variant="outline" className="border-emerald-500/40 text-emerald-600 dark:text-emerald-400">
                   Completed
+                </Badge>
+              )}
+              {othersHere.length > 0 && (
+                <Badge variant="outline" className="shrink-0 border-amber-500/40 text-amber-600 dark:text-amber-400">
+                  <Users /> {joinNames(othersHere)} {othersHere.length === 1 ? "is" : "are"} also here
                 </Badge>
               )}
             </div>
@@ -936,6 +1041,24 @@ function Workspace({
             <TooltipContent>Keyboard shortcuts (?)</TooltipContent>
           </Tooltip>
         </div>
+
+        {conflict && (
+          <div
+            role="alert"
+            className="flex shrink-0 flex-wrap items-center gap-2 border-b border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm"
+          >
+            <AlertTriangle className="size-4 shrink-0 text-amber-600 dark:text-amber-400" />
+            <span className="min-w-0 flex-1">
+              {conflict.message} <span className="text-muted-foreground">Your changes here are not saved yet.</span>
+            </span>
+            <Button size="xs" variant="outline" onClick={reloadFromServer}>
+              Load their version
+            </Button>
+            <Button size="xs" onClick={keepMine}>
+              Keep mine
+            </Button>
+          </div>
+        )}
 
         <div className="shrink-0">
           <VideoPlayer

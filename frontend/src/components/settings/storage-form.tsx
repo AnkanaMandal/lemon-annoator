@@ -333,9 +333,8 @@ export function StorageForm({ project }: { project: Project }) {
         <div className="flex gap-2 rounded-lg border border-dashed p-3 text-xs text-muted-foreground">
           <ShieldAlert className="mt-0.5 size-4 shrink-0" />
           <p>
-            Keys are stored in plain text in{" "}
-            <code className="font-mono">app_data/projects/{project.id}/project.json</code> on this machine and are never
-            sent back to the browser. Use an IAM user with read-only access to this bucket.
+            Keys are stored in this project&apos;s database row and are never sent back to the browser. Use an IAM user
+            with read-only access to this bucket, or leave both keys empty to use the AWS keys set on the API server.
           </p>
         </div>
       </CardContent>
