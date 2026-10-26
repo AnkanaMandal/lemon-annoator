@@ -1,9 +1,9 @@
 # Lemon
 
-Lemon is a self-hosted web app for annotating videos stored in AWS S3 (or any S3-compatible store). Each project
-points at one bucket folder and has its own label schema. Videos stream directly from S3 through short-lived
-presigned URLs, so nothing large is copied to your machine. Projects, labels and exports are plain JSON files in
-`./app_data`.
+Lemon is a web app for annotating videos stored in AWS S3 (or any S3-compatible store), built for a small team
+working on the same projects. Each project points at one bucket folder and has its own label schema. Videos stream
+directly from S3 through short-lived presigned URLs, so nothing large is copied anywhere. Projects, labels and
+exports are stored in Postgres (Supabase), and everyone signs in with a Supabase account.
 
 ## Features
 
@@ -14,14 +14,76 @@ presigned URLs, so nothing large is copied to your machine. Projects, labels and
 - A label schema per project, built visually or pasted as a Label Studio config.
 - Changes save automatically and stay saved until you clear them.
 - One-click export of the whole project to a single JSON file.
+- Several people on one project: a save never silently overwrites someone else's, the queue shows who has which
+  video open, and status updates appear within seconds.
 
 ## Requirements
 
 - Node.js 20.9 or later
 - Python 3.10 or later
 - An S3 bucket with `.mp4` or `.mov` videos encoded as H.264 (other files are ignored)
+- A [Supabase](https://supabase.com) project (free plan is fine) for the database and sign-in
+- To run tests: a local Postgres (`brew install postgresql`)
 
-## Install and run
+## Deploy (Supabase + Render + Vercel)
+
+The frontend runs on Vercel, the API on Render, and the data and sign-in in Supabase. The browser calls the API
+directly; the API checks the user's Supabase sign-in on every request. Deploy in this order.
+
+### 1. Supabase
+
+1. Create a project and note the database password.
+2. Authentication > Sign In / Providers: keep **Email** enabled and turn off **Allow new users to sign up**.
+   Authentication > Users > Add user: create an account (email + password, tick "Auto confirm") for each person.
+3. Collect these values:
+
+| Value | Where in Supabase | Used as |
+| --- | --- | --- |
+| Project URL | Project Settings > Data API (`https://<ref>.supabase.co`) | `LEMON_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_URL` |
+| Publishable key | Project Settings > API Keys (`sb_publishable_...`, or the legacy `anon` key) | `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` |
+| Session pooler connection string | **Connect** (top bar) > Connection String > Method: Session pooler | `LEMON_DATABASE_URL` |
+
+Put the database password into the connection string in place of `[YOUR-PASSWORD]`. Use the **session pooler**
+string: the direct connection is IPv6-only and Render cannot reach it. Never use the `service_role` / secret key
+anywhere in Lemon. The API creates its tables (schema `lemon`) on first start; no SQL needs to be run.
+
+### 2. Render (API)
+
+New > Blueprint > select this repository (it reads `render.yaml`) and fill in:
+
+| Variable | Value |
+| --- | --- |
+| `LEMON_DATABASE_URL` | the session pooler connection string |
+| `LEMON_SUPABASE_URL` | `https://<ref>.supabase.co` |
+| `LEMON_ALLOWED_EMAILS` | `you@example.com,friend@example.com` |
+| `LEMON_CORS_ORIGINS` | your Vercel URL, e.g. `https://lemon-yourname.vercel.app` (fill in after step 3 if you don't know it yet) |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | a read-only IAM key (see AWS setup). Optional: keys can be entered per project instead |
+
+Check `https://<service>.onrender.com/api/health` answers `{"ok": true, ...}`. If your Supabase project still uses
+the legacy JWT secret, also set `LEMON_SUPABASE_JWT_SECRET` (Project Settings > JWT Keys).
+
+### 3. Vercel (web app)
+
+Add New > Project > import this repository, set **Root Directory** to `frontend`, and add these environment
+variables before the first deploy (they are built into the app, so redeploy after changing them):
+
+| Variable | Value |
+| --- | --- |
+| `NEXT_PUBLIC_SUPABASE_URL` | `https://<ref>.supabase.co` |
+| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | the publishable key |
+| `NEXT_PUBLIC_API_URL` | the Render URL, e.g. `https://lemon-api.onrender.com` |
+
+Then put the Vercel URL in Render's `LEMON_CORS_ORIGINS` (Render redeploys on save) and, in Supabase,
+Authentication > URL Configuration > Site URL.
+
+### Free plans
+
+- Render's free API sleeps after 15 idle minutes; the first request then takes up to a minute while it wakes. The
+  $7/month Starter instance stays awake.
+- Supabase pauses free projects after a week without activity; resume it from the dashboard. The database is backed
+  up daily on paid plans only, so export regularly if you stay on the free plan.
+
+## Install and run locally
 
 ### One command
 
@@ -30,7 +92,10 @@ npm run setup     # first time: Python virtual env, Python and Node dependencies
 npm run dev       # starts the API and the web app; Ctrl+C stops both
 ```
 
-Open the URL that is printed (normally http://localhost:3000).
+Before `npm run dev`, fill in `backend/.env` (`LEMON_DATABASE_URL`, `LEMON_SUPABASE_URL`) and
+`frontend/.env.local` (`NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`; leave
+`NEXT_PUBLIC_API_URL` empty). A second Supabase project for development keeps test data out of the shared one.
+Open the URL that is printed (normally http://localhost:3000) and sign in.
 
 - Ports default to 8000 (API) and 3000 (web app). If one is taken, the next free port is used and the web app is
   connected to it automatically. To choose ports yourself: `API_PORT=8100 WEB_PORT=3100 npm run dev`
@@ -76,15 +141,23 @@ match, then restart the frontend.
 
 ## Configuration
 
-No environment variables are required. AWS credentials are entered per project in the app.
+Backend variables go in `backend/.env` locally and in Render's environment in production; frontend variables go in
+`frontend/.env.local` locally and in Vercel's environment in production. The `.env.example` files describe each one.
 
-| File | Variable | Default | Purpose |
+| Where | Variable | Default | Purpose |
 | --- | --- | --- | --- |
-| `backend/.env` | `LEMON_DATA_DIR` | `./app_data` | Where projects, labels and exports are stored |
-| `backend/.env` | `LEMON_ALLOWED_HOSTS` | `localhost,127.0.0.1,::1` | Host names the API accepts (protects against DNS rebinding) |
-| `backend/.env` | `LEMON_MAX_LIST_KEYS` | `50000` | Maximum number of S3 objects scanned per listing |
-| `backend/.env` | `LEMON_CORS_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | Only needed if you call the API directly from a browser |
-| `frontend/.env.local` | `BACKEND_URL` | `http://127.0.0.1:8000` | Where the web app sends `/api` requests |
+| API | `LEMON_DATABASE_URL` | (required) | Postgres connection string (Supabase session pooler) |
+| API | `LEMON_SUPABASE_URL` | (required) | `https://<ref>.supabase.co`, used to verify sign-in tokens |
+| API | `LEMON_SUPABASE_JWT_SECRET` | empty | Only for Supabase projects still on the legacy JWT secret |
+| API | `LEMON_ALLOWED_EMAILS` | empty (anyone in the Supabase project) | Emails allowed to use the API |
+| API | `LEMON_CORS_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | Browser origins allowed to call the API (the Vercel URL) |
+| API | `LEMON_CORS_ORIGIN_REGEX` | empty | Extra origins as a regex, e.g. Vercel preview URLs |
+| API | `LEMON_DB_SCHEMA` | `lemon` | Postgres schema for Lemon's tables |
+| API | `LEMON_MAX_LIST_KEYS` | `50000` | Maximum number of S3 objects scanned per listing |
+| Web | `NEXT_PUBLIC_SUPABASE_URL` | (required) | Supabase project URL |
+| Web | `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | (required) | Supabase publishable (or legacy anon) key |
+| Web | `NEXT_PUBLIC_API_URL` | empty | The API's URL in production; empty locally |
+| Web | `BACKEND_URL` | `http://127.0.0.1:8000` | Local only: where `/api` requests are proxied |
 
 If a project's access key fields are left empty, the backend uses the standard AWS credential chain
 (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, `~/.aws/credentials`, SSO or an instance role).
@@ -118,8 +191,9 @@ If a project's access key fields are left empty, the backend uses the standard A
 
 S3-compatible stores (MinIO, Cloudflare R2, Wasabi) are supported: open Advanced and set the custom endpoint URL.
 
-Credentials are stored in plain text in `app_data/projects/<id>/project.json`. They are never sent back to the
-browser, and `app_data/` is excluded from git. Use a read-only IAM user.
+Keys entered in the app are stored in the project's database row (readable only by the API, not through Supabase's
+public keys) and are never sent back to the browser. Alternatively leave them empty and set `AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY` on the API server. Either way, use a read-only IAM user.
 
 ## Using Lemon
 
@@ -200,27 +274,37 @@ a warning.
 
 On macOS, use `Cmd` instead of `Ctrl`.
 
+### Working together
+
+- Everyone signs in with their own account and sees the same projects.
+- The queue shows a letter badge on videos someone else has open, and the video header says who else is on the
+  current video. Save & Next skips videos that someone else has open.
+- Status changes (in progress, completed, event counts) from others appear within about 15 seconds. If someone saves
+  a video you have open and you have no unsaved changes, their version is loaded for you.
+- If you both edit the same video, the second save is refused instead of overwriting: a bar above the player offers
+  **Load their version** or **Keep mine**. Autosave pauses until you choose.
+
 ### Saving and persistence
 
-Annotations stay on disk until you clear them.
+Annotations stay in the database until you clear them.
 
 - Changes are saved automatically about a second after you make them, when you switch videos, and when you leave
   the annotation view. Export saves any pending change before exporting. Closing the browser tab with a change that
   has not been written yet asks for confirmation.
 - A video becomes "in progress" when something is saved for it, and "completed" when you use Save & Next. A
   completed video stays completed when you edit it later.
-- To remove a video's annotations, right-click it and choose Clear annotations. Deleting a project moves the whole
-  project folder. In both cases the files go to `app_data/.trash/`, from where they can be restored. Lemon never
-  empties the trash; delete those folders yourself when you no longer need them.
-- Each export writes a new timestamped file and keeps the earlier ones.
+- To remove a video's annotations, right-click it and choose Clear annotations. Clearing annotations or deleting a
+  project only marks the rows deleted (`deleted_at`); nothing is erased, and clearing `deleted_at` restores them.
+- Each export is also stored in the `lemon.exports` table, and earlier ones are kept.
 
 The browser also remembers, per browser: the theme, the panel layout, the capture options, the last video opened
 in each project, and each project's queue filter and search. Clearing the site data in the browser resets these.
 
 ### Export
 
-Export Project JSON writes `app_data/projects/<id>/exports/<project>_<timestamp>.json` and downloads a copy. It
-contains every video in the current bucket folder, annotated or not:
+Export Project JSON downloads `<project>_<timestamp>.json` and keeps a copy in the `lemon.exports` table. It
+contains every video in the current bucket folder, annotated or not. Each video also has `annotated_by`, the person
+who saved it last:
 
 ```json
 {
@@ -271,27 +355,27 @@ Timestamp events, when the schema has them, look like this:
 Checkbox fields are always written as `true` or `false`. `streaming_url` is the presigned URL in use when the video
 was last saved and expires by design; use `s3_uri` as the permanent reference.
 
-## Data on disk
+## Data in the database
 
-```
-app_data/
-  projects/<project-id>/
-    project.json              project settings, storage credentials, label schema
-    annotations/<video>.json  one file per annotated video
-    annotations/_index.json   status index, rebuilt automatically from the files if needed
-    exports/                  one file per export
-  .trash/                     deleted projects, cleared and unreadable annotation files
-```
+All tables are in the `lemon` schema, created by the API on startup (`backend/app/db.py`):
 
-All files are written atomically (to a temporary file, then renamed), so an interrupted write never leaves a
-partial file.
+| Table | Contents |
+| --- | --- |
+| `projects` | one row per project; `data` holds settings, storage credentials and the label schema |
+| `annotations` | one row per annotated video; `data` holds the events and labels, `revision` counts saves, `updated_by` names who saved last |
+| `presence` | which video each person has open (heartbeats every 15 seconds) |
+| `exports` | every export, with who made it |
+
+Row level security is enabled with no policies, so only the API (connecting as the table owner) can read them.
 
 ## How it works
 
-- The frontend is Next.js 16 (App Router) with React 19, Tailwind CSS and shadcn/ui. It forwards `/api` requests to
-  the backend, so the browser talks to a single origin.
-- The backend is FastAPI with boto3. It lists the bucket, checks objects, creates presigned URLs and reads and
-  writes the JSON files.
+- The frontend is Next.js 16 (App Router) with React 19, Tailwind CSS and shadcn/ui. It signs in with Supabase Auth
+  and sends the access token with every API call. In production it calls the API directly (`NEXT_PUBLIC_API_URL`);
+  locally it forwards `/api` requests to the backend.
+- The backend is FastAPI with boto3 and psycopg. It verifies the sign-in token, lists the bucket, checks objects,
+  creates presigned URLs, and reads and writes Postgres. Saves carry the revision they started from, and a save
+  based on an older revision is refused with a conflict.
 - The video element streams from S3 with HTTP range requests, so seeking does not download the whole file. When a
   presigned URL expires during playback, a new one is fetched and playback resumes at the same position.
 
@@ -300,19 +384,22 @@ partial file.
 ```
 backend/
   app/
-    main.py          FastAPI app, error handling, host check
+    main.py          FastAPI app, error handling, CORS
     config.py        LEMON_* settings
+    auth.py          Supabase sign-in token verification
+    db.py            Postgres connection pool and table definitions
     models.py        data models
-    storage.py       JSON storage under app_data
+    storage.py       projects, annotations, presence and exports in Postgres
     s3_service.py    S3 access and error messages
-    routers/         projects, videos and annotations, export
-  tests/             API tests against a simulated S3
+    routers/         projects, videos, annotations, presence, export
+  tests/             API tests against a simulated S3 and a throwaway Postgres
 frontend/
   src/
     app/             pages: dashboard, annotate, settings
     components/      annotate, settings, dashboard, project, ui
     hooks/           data fetching, keyboard shortcuts
-    lib/             API client, types, schema and Label Studio config handling
+    lib/             API client, Supabase sign-in, types, schema and Label Studio config handling
+render.yaml          Render Blueprint for the API
 scripts/
   setup.mjs          first-time setup
   dev.mjs            runs backend and frontend together
@@ -328,12 +415,17 @@ scripts/
 | "Your computer clock is out of sync" | Turn on automatic time sync. AWS signatures depend on the clock. |
 | A video does not play but the connection works | The file is probably HEVC (H.265) or ProRes, which browsers cannot decode. Re-encode it to H.264, for example `ffmpeg -i in.mov -c:v libx264 -pix_fmt yuv420p -movflags +faststart out.mp4`. |
 | A video is missing from the queue | Only `.mp4` and `.mov` files under the folder prefix are listed. Use Sync storage or the refresh button in the queue. |
-| "The Lemon API did not respond" | The backend is not running, or the frontend points at the wrong port (`BACKEND_URL`). |
+| "The Lemon API did not respond" / "Cannot reach the Lemon API" | Locally: the backend is not running, or `BACKEND_URL` points at the wrong port. In production: Render is waking up (wait a minute), `NEXT_PUBLIC_API_URL` is wrong, or the Vercel URL is missing from `LEMON_CORS_ORIGINS`. |
+| "Sign in to use Lemon" / "Your sign-in token is invalid" | Sign in again. If it persists, check that `LEMON_SUPABASE_URL` on the API matches `NEXT_PUBLIC_SUPABASE_URL`. |
+| "... is not allowed to use this Lemon" | Add the email to `LEMON_ALLOWED_EMAILS` on the API. |
+| "The database is not reachable right now" | The Supabase project is paused (resume it), or `LEMON_DATABASE_URL` is wrong. |
+| The API fails to start on Render with "Could not connect to the database" | Use the session pooler connection string, with the database password filled in. |
 | "Another next dev server is already running" | The frontend is already running from this folder. Use that one, or stop it first. |
 
 ## Development
 
-Backend tests run against a simulated S3 and need no AWS account:
+Backend tests run against a simulated S3 and a throwaway Postgres started from your local Postgres install (or the
+database in `LEMON_TEST_DATABASE_URL`); they need no AWS or Supabase account:
 
 ```bash
 cd backend

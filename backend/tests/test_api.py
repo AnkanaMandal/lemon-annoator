@@ -1,8 +1,7 @@
 import json
-from pathlib import Path
 
 
-def test_project_lifecycle(client):
+def test_project_lifecycle(client, db):
     created = client.post("/api/projects", json={"name": "Tennis  Q3", "description": "rallies"})
     assert created.status_code == 201
     pid = created.json()["id"]
@@ -13,8 +12,11 @@ def test_project_lifecycle(client):
     assert listed[0]["storage"]["is_configured"] is False
 
     deleted = client.delete(f"/api/projects/{pid}").json()
-    assert ".trash" in deleted["moved_to"] and Path(deleted["moved_to"]).exists()
+    assert deleted["ok"] and deleted["deleted_at"]
     assert client.get(f"/api/projects/{pid}").status_code == 404
+    assert client.get("/api/projects").json() == []
+    # Soft delete: the row is kept and can be restored.
+    assert db("select deleted_at from {s}.projects where id = %s", (pid,))[0]["deleted_at"] is not None
 
 
 def test_secret_is_never_returned(client, project):
@@ -110,7 +112,7 @@ def test_save_normalises_events_and_updates_queue(client, project):
     assert queue[key]["status"] == "completed" and queue[key]["event_count"] == 2
 
 
-def test_export(client, project):
+def test_export(client, project, db):
     client.put(
         f"/api/projects/{project}/annotations",
         params={"key": "clips/serve_003.mov"},
@@ -119,7 +121,6 @@ def test_export(client, project):
         ]},
     )
     res = client.post(f"/api/projects/{project}/export").json()
-    assert Path(res["path"]).exists()
     data = res["data"]
     assert data["summary"] == {"total_videos": 3, "completed": 0, "in_progress": 1, "not_started": 2, "total_events": 1}
 
@@ -127,17 +128,10 @@ def test_export(client, project):
     assert mov["streaming_url"] == "https://example.com/u"
     assert mov["events"][0]["event_name"] == "Smash"
     assert mov["events"][0]["checkboxes"] == {"forehand": False, "winning_shot": True}
-    assert json.loads(Path(res["path"]).read_text(encoding="utf-8")) == data
-
-
-def test_index_rebuilds_when_deleted(client, project, tmp_path):
-    client.put(f"/api/projects/{project}/annotations", params={"key": "clips/rally_001.mp4"},
-               json={"status": "completed", "events": []})
-    index = tmp_path / "app_data" / "projects" / project / "annotations" / "_index.json"
-    index.unlink()
-    queue = {v["key"]: v for v in client.get(f"/api/projects/{project}/videos").json()["videos"]}
-    assert queue["clips/rally_001.mp4"]["status"] == "completed"
-    assert index.exists()
+    assert mov["annotated_by"] == "ankana"
+    stored = db("select filename, created_by, data from {s}.exports where id = %s", (res["export_id"],))[0]
+    assert stored["filename"] == res["filename"] and stored["created_by"] == "ankana"
+    assert stored["data"] == data
 
 
 def test_video_details(client, project):
@@ -149,28 +143,29 @@ def test_video_details(client, project):
     assert d["filename"] == "RALLY_002.MP4" and d["folder"] == "clips/set2/" and d["extension"] == ".mp4"
     assert d["s3_uri"] == f"s3://test-videos/{key}" and d["size"] == 16 and d["s3_error"] is None
     assert d["status"] == "completed" and d["event_count"] == 1 and d["duration_seconds"] == 8.0
-    assert d["annotation_file"].endswith(".json") and d["console_url"].startswith("https://s3.console.aws.amazon.com/")
+    assert d["annotated_by"] == "ankana" and d["console_url"].startswith("https://s3.console.aws.amazon.com/")
 
     # Gone from the bucket: S3 error reported inline, request still succeeds.
     gone = client.get(f"/api/projects/{project}/videos/details", params={"key": "clips/gone.mp4"}).json()
     assert gone["s3_error"] and gone["size"] is None and gone["status"] == "not_started"
 
 
-def test_clear_annotations_moves_file_to_trash(client, project, tmp_path):
+def test_clear_annotations_keeps_a_copy(client, project, db):
     key = "clips/rally_001.mp4"
     client.put(f"/api/projects/{project}/annotations", params={"key": key},
                json={"status": "completed", "events": [
                    {"id": "a", "timestamp": 1, "event_name": "Smash", "checkboxes": {}, "attributes": {}, "note": ""}]})
     res = client.delete(f"/api/projects/{project}/annotations", params={"key": key}).json()
-    assert res["cleared"] is True
-    assert Path(res["moved_to"]).exists() and ".trash" in res["moved_to"]
+    assert res == {"key": key, "cleared": True}
+    kept = db("select deleted_by, data from {s}.annotations where video_key = %s", (key,))
+    assert len(kept) == 1 and kept[0]["deleted_by"] == "ankana" and kept[0]["data"]["event_count"] == 1
 
     assert client.get(f"/api/projects/{project}/annotations", params={"key": key}).json() is None
     queue = {v["key"]: v for v in client.get(f"/api/projects/{project}/videos").json()["videos"]}
     assert queue[key]["status"] == "not_started" and queue[key]["event_count"] == 0
 
     again = client.delete(f"/api/projects/{project}/annotations", params={"key": key}).json()
-    assert again == {"key": key, "cleared": False, "moved_to": None}
+    assert again == {"key": key, "cleared": False}
 
 
 def test_choices_fields(client, project):

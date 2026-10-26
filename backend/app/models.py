@@ -270,9 +270,15 @@ class VideoAnnotation(BaseModel):
     labels: dict[str, bool | str | list[str] | None] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
+    # Set from the database row, not stored in `data`: how many times it was saved, and by whom.
+    revision: int = 0
+    updated_by: str | None = None
 
 
 class AnnotationSave(BaseModel):
+    # The revision this save is based on (0: none saved yet). If someone else saved since, the save is
+    # refused with a conflict instead of overwriting their work. Omit to save unconditionally.
+    base_revision: int | None = Field(None, ge=0)
     status: Literal["in_progress", "completed"] = "in_progress"
     events: list[AnnotationEvent] = Field(default_factory=list, max_length=20_000)
     labels: dict[str, bool | str | list[str] | None] = Field(default_factory=dict)
@@ -285,8 +291,9 @@ class IndexEntry(BaseModel):
     status: VideoStatus
     event_count: int
     updated_at: datetime
-    file: str
     bucket: str | None = None
+    revision: int = 1
+    updated_by: str | None = None
 
 
 class VideoItem(BaseModel):
@@ -297,7 +304,8 @@ class VideoItem(BaseModel):
     status: VideoStatus = "not_started"
     event_count: int = 0
     annotated_at: datetime | None = None
-    missing: bool = Field(False, description="Annotated locally but no longer in the bucket")
+    annotated_by: str | None = None
+    missing: bool = Field(False, description="Annotated but no longer in the bucket")
 
 
 class VideoList(BaseModel):
@@ -335,7 +343,7 @@ class VideoDetails(BaseModel):
     status: VideoStatus = "not_started"
     event_count: int = 0
     annotated_at: datetime | None = None
-    annotation_file: str | None = None
+    annotated_by: str | None = None
     streaming_url: str | None = None
     duration_seconds: float | None = None
 
@@ -343,7 +351,33 @@ class VideoDetails(BaseModel):
 class ClearResult(BaseModel):
     key: str
     cleared: bool
-    moved_to: str | None
+
+
+class Presence(BaseModel):
+    user_id: str
+    name: str
+    video_key: str | None
+    seen_at: datetime
+
+
+class PresenceUpdate(BaseModel):
+    key: str | None = None
+
+
+class VideoActivity(BaseModel):
+    status: VideoStatus
+    event_count: int
+    annotated_at: datetime
+    annotated_by: str | None
+    revision: int
+
+
+class ProjectActivity(BaseModel):
+    """What changed since the queue was listed: saved status per video, and who is on which video."""
+
+    me: str
+    videos: dict[str, VideoActivity]
+    presence: list[Presence]
 
 
 class ConnectionTestResult(BaseModel):
@@ -358,7 +392,7 @@ class ConnectionTestResult(BaseModel):
 
 class ExportResult(BaseModel):
     filename: str
-    path: str
+    export_id: int
     video_count: int
     event_count: int
     warnings: list[str]

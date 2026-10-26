@@ -4,6 +4,7 @@ import type {
   ConnectionTestResult,
   ExportResult,
   Project,
+  ProjectActivity,
   ProjectUpdate,
   StorageUpdate,
   StreamUrl,
@@ -11,6 +12,10 @@ import type {
   VideoDetails,
   VideoList,
 } from "./types";
+import { accessToken, signOut } from "./supabase";
+
+/** The Lemon API (Render) in production. Empty in local development: /api is proxied by Next.js. */
+const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? "").replace(/\/$/, "");
 
 export class ApiError extends Error {
   constructor(
@@ -25,20 +30,24 @@ export class ApiError extends Error {
   }
 }
 
+const UNREACHABLE_HINT = API_URL
+  ? "If the API runs on Render's free plan it can take a minute to wake up; try again shortly."
+  : "Make sure the backend is running (npm run dev from the repo root).";
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = await accessToken();
   let res: Response;
   try {
-    res = await fetch(path, {
+    res = await fetch(API_URL + path, {
       ...init,
-      headers: { "Content-Type": "application/json", ...init?.headers },
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...init?.headers,
+      },
     });
   } catch {
-    throw new ApiError(
-      "Cannot reach the Lemon API.",
-      0,
-      "API_UNREACHABLE",
-      "Make sure the backend is running (npm run dev from the repo root).",
-    );
+    throw new ApiError("Cannot reach the Lemon API.", 0, "API_UNREACHABLE", UNREACHABLE_HINT);
   }
 
   if (res.ok) {
@@ -57,16 +66,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     body as { error?: { code?: string; message?: string; hint?: string; details?: Record<string, unknown> } }
   )?.error;
   if (err?.message) {
+    // The session is no longer valid: back to the sign-in screen.
+    if (err.code === "UNAUTHORIZED") void signOut();
     throw new ApiError(err.message, res.status, err.code, err.hint ?? null, err.details ?? {});
   }
-  if (res.status === 500 || res.status === 502 || res.status === 504) {
-    // Next.js proxy returns a bare 500 when FastAPI is down.
-    throw new ApiError(
-      "The Lemon API did not respond.",
-      res.status,
-      "API_UNREACHABLE",
-      "Start the backend: npm run dev (repo root) or uvicorn app.main:app --port 8000.",
-    );
+  if (res.status === 500 || res.status === 502 || res.status === 503 || res.status === 504) {
+    // A proxy (Next.js locally, Render while starting) answers without a JSON body when FastAPI is down.
+    throw new ApiError("The Lemon API did not respond.", res.status, "API_UNREACHABLE", UNREACHABLE_HINT);
   }
   throw new ApiError(`Request failed (${res.status})`, res.status);
 }
@@ -82,7 +88,7 @@ export const api = {
   updateProject: (id: string, body: ProjectUpdate) =>
     request<Project>(`/api/projects/${id}`, { method: "PATCH", body: json(body) }),
   deleteProject: (id: string) =>
-    request<{ ok: boolean; moved_to: string }>(`/api/projects/${id}`, { method: "DELETE" }),
+    request<{ ok: boolean; deleted_at: string }>(`/api/projects/${id}`, { method: "DELETE" }),
   testStorage: (id: string, storage?: StorageUpdate) =>
     request<ConnectionTestResult>(`/api/projects/${id}/storage/test`, {
       method: "POST",
@@ -103,7 +109,14 @@ export const api = {
       body: json(body),
     }),
   exportProject: (id: string) => request<ExportResult>(`/api/projects/${id}/export`, { method: "POST" }),
+  activity: (id: string) => request<ProjectActivity>(`/api/projects/${id}/activity`),
+  /** "I have this video open" (null: none); returns the latest activity. */
+  presence: (id: string, key: string | null) =>
+    request<ProjectActivity>(`/api/projects/${id}/presence`, { method: "PUT", body: json({ key }) }),
 };
+
+export const isConflict = (error: unknown): error is ApiError =>
+  error instanceof ApiError && error.code === "ANNOTATION_CONFLICT";
 
 export function errorMessage(error: unknown): { title: string; hint: string | null } {
   if (error instanceof ApiError) return { title: error.message, hint: error.hint };

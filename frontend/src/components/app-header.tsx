@@ -2,6 +2,7 @@ import { Citrus } from "lucide-react";
 import Link from "next/link";
 
 import { ThemeToggle } from "@/components/theme-toggle";
+import { UserMenu } from "@/components/user-menu";
 import { cn } from "@/lib/utils";
 
 export const APP_NAME = "Lemon";
@@ -31,6 +32,7 @@ export function AppHeader({ children, actions }: { children?: React.ReactNode; a
       <div className={cn("flex items-center gap-2.5", !children && "ml-auto")}>
         {actions}
         <ThemeToggle />
+        <UserMenu />
       </div>
     </header>
   );

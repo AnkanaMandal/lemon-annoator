@@ -44,8 +44,8 @@ export function ClearAnnotationsDialog({
               </p>
               {saved && (
                 <p>
-                  The saved file is moved to <code className="font-mono">app_data/.trash</code>, so it can still be
-                  recovered. The video in S3 is not touched.
+                  A copy is kept in the database, so it can still be recovered. This also affects everyone else on the
+                  project. The video in S3 is not touched.
                 </p>
               )}
             </div>

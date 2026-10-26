@@ -1,9 +1,19 @@
 "use client";
 
 import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useRef } from "react";
 
 import { api } from "@/lib/api";
-import type { AnnotationSave, Project, ProjectUpdate, VideoAnnotation, VideoList } from "@/lib/types";
+import type {
+  AnnotationSave,
+  Project,
+  ProjectActivity,
+  ProjectUpdate,
+  VideoActivity,
+  VideoAnnotation,
+  VideoItem,
+  VideoList,
+} from "@/lib/types";
 
 export const keys = {
   projects: ["projects"] as const,
@@ -12,6 +22,7 @@ export const keys = {
   streamUrl: (id: string, key: string) => ["projects", id, "stream-url", key] as const,
   annotation: (id: string, key: string) => ["projects", id, "annotation", key] as const,
   details: (id: string, key: string) => ["projects", id, "details", key] as const,
+  activity: (id: string) => ["projects", id, "activity"] as const,
 };
 
 export function useProjects() {
@@ -89,12 +100,65 @@ export function useStreamUrl(id: string, key: string | null) {
   return useQuery({ ...streamUrlQuery(id, key ?? ""), enabled: Boolean(key) });
 }
 
+/** Refetched whenever a video is opened, so edits start from what the other person last saved. */
 export function useAnnotation(id: string, key: string | null) {
   return useQuery({
     queryKey: keys.annotation(id, key ?? ""),
     queryFn: () => api.getAnnotation(id, key!),
     enabled: Boolean(key),
-    staleTime: Infinity,
+    staleTime: 0,
+  });
+}
+
+const ACTIVITY_POLL_MS = 15_000;
+
+/**
+ * Polls what others are doing in the project: saved status per video, and who has which video
+ * open. Each poll is also this user's heartbeat for the video they have open (`activeKey`).
+ */
+export function useActivity(id: string, activeKey: string | null) {
+  const qc = useQueryClient();
+  const keyRef = useRef(activeKey);
+  useEffect(() => {
+    keyRef.current = activeKey;
+  });
+  const query = useQuery({
+    queryKey: keys.activity(id),
+    queryFn: () => api.presence(id, keyRef.current),
+    staleTime: 0,
+    refetchInterval: ACTIVITY_POLL_MS,
+    refetchIntervalInBackground: true,
+    refetchOnWindowFocus: true,
+    retry: false, // the next poll is the retry
+  });
+  // Announce a video switch right away rather than at the next poll.
+  useEffect(() => {
+    void qc.refetchQueries({ queryKey: keys.activity(id), exact: true });
+  }, [activeKey, id, qc]);
+  // Leaving the annotation view: no longer on any video.
+  useEffect(() => () => void api.presence(id, null).catch(() => {}), [id]);
+  return query;
+}
+
+/** The queue with the latest saved status from activity polling (which may come from someone else). */
+export function withActivity(videos: VideoItem[], activity: Record<string, VideoActivity> | undefined): VideoItem[] {
+  if (!activity) return videos;
+  return videos.flatMap((v) => {
+    const a = activity[v.key];
+    if (a) {
+      return [
+        {
+          ...v,
+          status: a.status,
+          event_count: a.event_count,
+          annotated_at: a.annotated_at,
+          annotated_by: a.annotated_by,
+        },
+      ];
+    }
+    if (v.missing) return []; // its annotations were all that kept it in the queue, and they were cleared
+    if (v.status === "not_started") return [v];
+    return [{ ...v, status: "not_started" as const, event_count: 0, annotated_at: null, annotated_by: null }];
   });
 }
 
@@ -105,16 +169,18 @@ export function useSaveAnnotation(id: string) {
     onSuccess: (saved: VideoAnnotation, { key }) => {
       qc.setQueryData(keys.annotation(id, key), saved);
       qc.removeQueries({ queryKey: keys.details(id, key) });
+      const status = {
+        status: saved.status,
+        event_count: saved.events.length,
+        annotated_at: saved.updated_at,
+        annotated_by: saved.updated_by,
+      };
       qc.setQueryData<VideoList>(keys.videos(id), (prev) =>
+        prev ? { ...prev, videos: prev.videos.map((v) => (v.key === key ? { ...v, ...status } : v)) } : prev,
+      );
+      qc.setQueryData<ProjectActivity>(keys.activity(id), (prev) =>
         prev
-          ? {
-              ...prev,
-              videos: prev.videos.map((v) =>
-                v.key === key
-                  ? { ...v, status: saved.status, event_count: saved.events.length, annotated_at: saved.updated_at }
-                  : v,
-              ),
-            }
+          ? { ...prev, videos: { ...prev.videos, [key]: { ...status, revision: saved.revision } as VideoActivity } }
           : prev,
       );
       qc.invalidateQueries({ queryKey: keys.projects, exact: true });

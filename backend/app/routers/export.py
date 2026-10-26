@@ -4,11 +4,12 @@ import posixpath
 from fastapi import APIRouter, Depends, Query
 
 from .. import __version__, s3_service
+from ..auth import User, current_user
 from ..config import get_settings
 from ..deps import get_store
 from ..errors import S3Error
 from ..models import ExportResult, VideoAnnotation, utcnow
-from ..storage import ProjectStore
+from ..storage import ProjectStore, json_default
 
 router = APIRouter(prefix="/api/projects/{project_id}", tags=["export"])
 
@@ -25,6 +26,7 @@ def _video_entry(ann: VideoAnnotation) -> dict:
         "fps": ann.fps,
         "event_count": len(ann.events),
         "annotated_at": ann.updated_at,
+        "annotated_by": ann.updated_by,
         "labels": ann.labels,
         "events": [
             {
@@ -47,6 +49,7 @@ def export_project(
     project_id: str,
     include_unannotated: bool = Query(True),
     store: ProjectStore = Depends(get_store),
+    user: User = Depends(current_user),
 ):
     project = store.get(project_id)
     stored, warnings = store.iter_annotations(project_id)
@@ -60,7 +63,7 @@ def export_project(
     if skipped := len(stored) - len(annotations):
         warnings.append(
             f"{skipped} annotated video{'s' if skipped != 1 else ''} outside the current bucket/folder "
-            "were not exported (their files are still in app_data)."
+            "were not exported (their annotations are still saved)."
         )
     field_labels = {f.key: f.label for f in project.label_schema.fields}
 
@@ -90,6 +93,7 @@ def export_project(
                 "fps": project.settings.fps,
                 "event_count": 0,
                 "annotated_at": None,
+                "annotated_by": None,
                 "labels": {},
                 "events": [],
             }
@@ -125,13 +129,14 @@ def export_project(
         "videos": videos,
     }
 
-    path = store.write_export(project, data)
-    # Round-trip through the file so the browser download matches what was written to disk.
+    # Round-trip through JSON so the browser download matches what is stored.
+    data = json.loads(json.dumps(data, default=json_default))
+    export_id, filename = store.write_export(project, data, user.name)
     return ExportResult(
-        filename=path.name,
-        path=str(path),
+        filename=filename,
+        export_id=export_id,
         video_count=len(videos),
         event_count=event_count,
         warnings=warnings,
-        data=json.loads(path.read_text(encoding="utf-8")),
+        data=data,
     )

@@ -66,8 +66,9 @@ def update_project(project_id: str, body: ProjectUpdate, store: ProjectStore = D
 
 @router.delete("/{project_id}", status_code=status.HTTP_200_OK)
 def delete_project(project_id: str, store: ProjectStore = Depends(get_store)):
-    moved_to = store.delete(project_id)
-    return {"ok": True, "moved_to": str(moved_to)}
+    """Marks the project deleted; its rows stay in the database and can be restored."""
+    deleted_at = store.delete(project_id)
+    return {"ok": True, "deleted_at": deleted_at}
 
 
 @router.post("/{project_id}/storage/test", response_model=ConnectionTestResult)

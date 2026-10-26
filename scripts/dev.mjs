@@ -36,12 +36,12 @@ function portInUse(port) {
   });
 }
 
-/** Is a Lemon web app already being served here? (Its /api/health answers with a data_dir.) */
+/** Is a Lemon web app already being served here? (Its /api/health answers with app: "lemon".) */
 async function lemonAt(port) {
   try {
     const res = await fetch(`http://${HOST}:${port}/api/health`, { signal: AbortSignal.timeout(1500) });
     const body = await res.json();
-    return body?.ok === true && typeof body.data_dir === "string";
+    return body?.ok === true && body.app === "lemon";
   } catch {
     return false;
   }

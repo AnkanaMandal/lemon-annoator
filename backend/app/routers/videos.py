@@ -6,16 +6,20 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, Query
 
 from .. import s3_service
+from ..auth import User, current_user
 from ..config import get_settings
 from ..deps import get_store
 from ..errors import AppError, S3Error, StorageError, ValidationError
 from ..models import (
     AnnotationSave,
     ClearResult,
+    PresenceUpdate,
     Project,
+    ProjectActivity,
     SchemaField,
     StreamUrl,
     SyncInfo,
+    VideoActivity,
     VideoAnnotation,
     VideoDetails,
     VideoItem,
@@ -73,6 +77,7 @@ def sync_videos(project_id: str, store: ProjectStore) -> VideoList:
                 status=entry.status if entry else "not_started",
                 event_count=entry.event_count if entry else 0,
                 annotated_at=entry.updated_at if entry else None,
+                annotated_by=entry.updated_by if entry else None,
             )
         )
     # Never silently hide work: surface annotations whose video isn't in the listing. When the
@@ -87,6 +92,7 @@ def sync_videos(project_id: str, store: ProjectStore) -> VideoList:
                 status=entry.status,
                 event_count=entry.event_count,
                 annotated_at=entry.updated_at,
+                annotated_by=entry.updated_by,
                 missing=not truncated,
             )
         )
@@ -169,20 +175,24 @@ def video_details(project_id: str, key: str = Query(..., min_length=1), store: P
         details.status = annotation.status
         details.event_count = len(annotation.events)
         details.annotated_at = annotation.updated_at
-        details.annotation_file = str(store.annotation_path(project_id, key))
+        details.annotated_by = annotation.updated_by
         details.streaming_url = annotation.streaming_url
         details.duration_seconds = annotation.duration_seconds
     return details
 
 
 @router.delete("/annotations", response_model=ClearResult)
-def clear_annotation(project_id: str, key: str = Query(..., min_length=1), store: ProjectStore = Depends(get_store)):
-    """Clear a video's saved annotations (the file is moved to app_data/.trash)."""
+def clear_annotation(
+    project_id: str,
+    key: str = Query(..., min_length=1),
+    store: ProjectStore = Depends(get_store),
+    user: User = Depends(current_user),
+):
+    """Clear a video's saved annotations (the row is kept in the database, marked deleted)."""
     project = store.get(project_id)
-    # Clearing only touches local files, so keys outside the current folder are fine.
+    # Clearing only touches saved annotations, so keys outside the current folder are fine.
     require_video_key(project, key, inside_prefix=False)
-    moved = store.clear_annotation(project_id, key)
-    return ClearResult(key=key, cleared=moved is not None, moved_to=str(moved) if moved else None)
+    return ClearResult(key=key, cleared=store.clear_annotation(project_id, key, user.name))
 
 
 @router.get("/annotations", response_model=VideoAnnotation | None)
@@ -197,6 +207,7 @@ def save_annotation(
     body: AnnotationSave,
     key: str = Query(..., min_length=1),
     store: ProjectStore = Depends(get_store),
+    user: User = Depends(current_user),
 ):
     project = store.get(project_id)
     require_video_key(project, key)
@@ -219,6 +230,7 @@ def save_annotation(
         },
     }
 
+    base_revision = body.base_revision
     with store.lock(project_id):
         try:
             existing = store.get_annotation(project_id, key)
@@ -227,6 +239,7 @@ def save_annotation(
                 raise
             store.quarantine_annotation(project_id, key)  # unreadable: keep a copy, start fresh
             existing = None
+            base_revision = None  # nothing left to conflict with
         # Frames saved under a different FPS setting are recomputed from their timestamps.
         refresh_frames = bool(existing and existing.fps and existing.fps != fps)
 
@@ -274,7 +287,45 @@ def save_annotation(
             created_at=existing.created_at if existing else now,
             updated_at=now,
         )
-        return store.save_annotation(project_id, annotation)
+        return store.save_annotation(project_id, annotation, base_revision=base_revision, user=user.name)
+
+
+def activity(project_id: str, store: ProjectStore, user: User) -> ProjectActivity:
+    project = store.get(project_id)
+    index = store.load_index(project_id)
+    return ProjectActivity(
+        me=user.id,
+        videos={
+            key: VideoActivity(
+                status=e.status,
+                event_count=e.event_count,
+                annotated_at=e.updated_at,
+                annotated_by=e.updated_by,
+                revision=e.revision,
+            )
+            for key, e in index.items()
+            if belongs_to(e.bucket, project)
+        },
+        presence=store.list_presence(project_id),
+    )
+
+
+@router.get("/activity", response_model=ProjectActivity)
+def get_activity(project_id: str, store: ProjectStore = Depends(get_store), user: User = Depends(current_user)):
+    """Cheap refresh for the queue (no S3 listing): saved status per video and who is on which video."""
+    return activity(project_id, store, user)
+
+
+@router.put("/presence", response_model=ProjectActivity)
+def update_presence(
+    project_id: str,
+    body: PresenceUpdate,
+    store: ProjectStore = Depends(get_store),
+    user: User = Depends(current_user),
+):
+    """Heartbeat: "I have this video open" (key null: none). Returns the latest activity."""
+    store.touch_presence(project_id, user.id, user.name, body.key)
+    return activity(project_id, store, user)
 
 
 def normalize_value(field: SchemaField, value: str | list[str] | None) -> str | list[str] | None:

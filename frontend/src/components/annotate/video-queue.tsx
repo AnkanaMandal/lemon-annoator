@@ -60,6 +60,8 @@ interface Props {
   onClear: (video: VideoItem) => void;
   /** localStorage key under which the filter and search are remembered (per project). */
   storageKey: string;
+  /** Video key -> names of the other people who have it open. */
+  othersOn: Map<string, string[]>;
 }
 
 function readQueueView(storageKey: string): { query: string; filter: Filter } {
@@ -90,6 +92,7 @@ export function VideoQueue({
   onOpenVideo,
   onClear,
   storageKey,
+  othersOn,
 }: Props) {
   const [query, setQuery] = useState(() => readQueueView(storageKey).query);
   const [filter, setFilter] = useState<Filter>(() => readQueueView(storageKey).filter);
@@ -207,6 +210,8 @@ export function VideoQueue({
           const rel = v.key.startsWith(prefix) ? v.key.slice(prefix.length) : v.key;
           const folder = rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/") + 1) : "";
           const canClear = v.status !== "not_started" || v.event_count > 0 || (active && activeEventCount > 0);
+          const others = othersOn.get(v.key) ?? [];
+          const savedBy = v.annotated_by ? ` · last saved by ${v.annotated_by}` : "";
           return (
             <ContextMenu key={v.key}>
               <ContextMenuTrigger asChild>
@@ -215,7 +220,7 @@ export function VideoQueue({
                   type="button"
                   aria-current={active ? "true" : undefined}
                   onClick={() => onSelect(v.key)}
-                  title={`${v.key} · Right-click for options`}
+                  title={`${v.key}${savedBy} · Right-click for options`}
                   className={cn(
                     "group flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-colors [content-visibility:auto] [contain-intrinsic-size:auto_56px]",
                     active ? "bg-accent text-accent-foreground" : "hover:bg-muted/60 data-[state=open]:bg-muted/60",
@@ -234,6 +239,14 @@ export function VideoQueue({
                       {v.size != null && <span className="shrink-0">{formatBytes(v.size)}</span>}
                     </div>
                   </div>
+                  {others.length > 0 && (
+                    <span
+                      className="grid size-6 shrink-0 place-items-center rounded-full bg-amber-500/15 text-[11px] font-semibold text-amber-700 uppercase dark:text-amber-400"
+                      title={`${others.join(", ")} ${others.length === 1 ? "has" : "have"} this video open`}
+                    >
+                      {others.length === 1 ? others[0].slice(0, 1) : others.length}
+                    </span>
+                  )}
                   {v.event_count > 0 && (
                     <span className="rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground tabular-nums group-aria-[current=true]:bg-background">
                       {v.event_count}
